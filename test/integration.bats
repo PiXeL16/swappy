@@ -31,8 +31,8 @@ save_two_profiles() {
   [ "$(cat "$pdir/credentials.json")" = "$TOKEN_A" ]
   [ "$(json_get "$pdir/identity.json" oauthAccount.accountUuid)" = "uuid-alpha-0000-1111" ]
   [ "$(json_get "$pdir/identity.json" userID)" = "user-alpha-111" ]
-  [ "$(stat -f %Lp "$pdir" 2>/dev/null || stat -c %a "$pdir")" = "700" ]
-  [ "$(stat -f %Lp "$pdir/credentials.json" 2>/dev/null || stat -c %a "$pdir/credentials.json")" = "600" ]
+  [ "$(file_mode "$pdir")" = "700" ]
+  [ "$(file_mode "$pdir/credentials.json")" = "600" ]
   [ "$(json_get "$HOME/.config/swappy/state.json" active)" = "alpha" ]
 }
 

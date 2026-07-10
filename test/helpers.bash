@@ -76,6 +76,16 @@ with open(path, "w") as f:
 PY
 }
 
+# Octal permission bits of a file, portable across GNU and BSD stat.
+# (GNU treats -f as --file-system, so "try BSD then fall back" ordering must be GNU-first.)
+file_mode() {
+  if stat -c %a "$1" >/dev/null 2>&1; then
+    stat -c %a "$1"
+  else
+    stat -f %Lp "$1"
+  fi
+}
+
 # jq-less JSON field reader (python3 is swappy's only runtime dep, tests match).
 json_get() { # file dotted.path
   python3 - "$1" "$2" <<'PY'

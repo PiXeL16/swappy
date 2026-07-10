@@ -10,6 +10,7 @@ BACKUP_DIR="$SWAPPY_DIR/backup"
 CLAUDE_JSON="$HOME/.claude.json"
 CREDS_FILE="$HOME/.claude/.credentials.json"
 KEYCHAIN_SERVICE="Claude Code-credentials"
+KEYCHAIN_ACCOUNT="${USER:-$(id -un)}"
 # SWAPPY_KEYCHAIN (tests only): extra keychain path appended to every `security` call
 # SWAPPY_BACKEND (tests only): force "keychain" or "file" instead of auto-detection
 
@@ -51,7 +52,7 @@ detect_backend() {
   fi
   case "$(uname)" in
     Darwin)
-      if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1; then
+      if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1; then
         printf 'keychain'
       elif [ -f "$CREDS_FILE" ]; then
         printf 'file'
@@ -79,7 +80,7 @@ require_backend() {
 live_creds_read() {
   case "$BACKEND" in
     keychain)
-      security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
+      security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
       ;;
     file)
       cat "$CREDS_FILE"
@@ -92,7 +93,7 @@ live_creds_write() {
   local secret="$1" tmp
   case "$BACKEND" in
     keychain)
-      security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$secret" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
+      security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$secret" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
       ;;
     file)
       tmp="$(mktemp "$(dirname "$CREDS_FILE")/.credentials.XXXXXX")" || return 1
@@ -236,13 +237,22 @@ cmd_save() {
     fi
   done
 
+  # Re-saving a name that holds a DIFFERENT account would destroy its only token snapshot.
+  if [ -f "$PROFILES_DIR/$name/identity.json" ]; then
+    local stored_uuid
+    stored_uuid="$(identity_field "$PROFILES_DIR/$name/identity.json" accountUuid)"
+    if [ -n "$stored_uuid" ] && [ "$stored_uuid" != "$live_uuid" ]; then
+      die "profile '$name' holds a different account ($(identity_field "$PROFILES_DIR/$name/identity.json" emailAddress)) — 'swappy rm $name' first if you really mean to replace it"
+    fi
+  fi
+
   umask 077
   mkdir -p "$PROFILES_DIR/$name"
   chmod 700 "$PROFILES_DIR/$name"
   printf '%s' "$secret" >"$PROFILES_DIR/$name/credentials.json"
   printf '%s\n' "$identity" >"$PROFILES_DIR/$name/identity.json"
   chmod 600 "$PROFILES_DIR/$name/credentials.json" "$PROFILES_DIR/$name/identity.json"
-  state_update add "$name"
+  state_update add "$name" || die "failed to update state file $STATE_FILE — profile files were written, re-run 'swappy save $name' once the problem is fixed"
   printf "saved '%s' (%s)\n" "$name" "$(identity_field "$PROFILES_DIR/$name/identity.json" emailAddress)"
 }
 
@@ -308,7 +318,7 @@ cmd_use() {
     printf '%s' "$live_secret" >"$PROFILES_DIR/$owner/credentials.json"
     printf '%s\n' "$live_identity" >"$PROFILES_DIR/$owner/identity.json"
     chmod 600 "$PROFILES_DIR/$owner/credentials.json" "$PROFILES_DIR/$owner/identity.json"
-    [ "$(state_get active)" = "$owner" ] || state_update active "$owner"
+    [ "$(state_get active)" = "$owner" ] || state_update active "$owner" || die "failed to update state file $STATE_FILE"
   elif [ "$force" -ne 1 ]; then
     local live_email
     live_email="$(printf '%s' "$live_identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"].get("emailAddress",""))')"
@@ -329,13 +339,15 @@ cmd_use() {
   local target_secret
   target_secret="$(cat "$PROFILES_DIR/$name/credentials.json")"
   live_creds_write "$target_secret" || die "failed to write the live credential (backend: $BACKEND) — nothing changed"
-  if ! identity_swap "$PROFILES_DIR/$name/identity.json" 2>/dev/null; then
+  local swap_err
+  if ! swap_err="$(identity_swap "$PROFILES_DIR/$name/identity.json" 2>&1)"; then
+    swap_err="$(printf '%s' "$swap_err" | tail -1)"
     if ! live_creds_write "$live_secret"; then
-      die "identity swap of $CLAUDE_JSON failed AND rolling the credential back failed — restore manually from $BACKUP_DIR"
+      die "identity swap of $CLAUDE_JSON failed ($swap_err) AND rolling the credential back failed — restore manually from $BACKUP_DIR"
     fi
-    die "identity swap of $CLAUDE_JSON failed — rolled the live credential back, nothing changed"
+    die "identity swap of $CLAUDE_JSON failed ($swap_err) — rolled the live credential back, nothing changed"
   fi
-  state_update active "$name"
+  state_update active "$name" || die "switched, but failed to record it in $STATE_FILE — fix that file, then 'swappy save $name' to resync"
   printf "switched to %s (%s)\n" "$name" "$(identity_field "$PROFILES_DIR/$name/identity.json" emailAddress)"
   if pgrep -x claude >/dev/null 2>&1; then
     printf 'note: running claude sessions keep the previous token in memory — new sessions use %s\n' "$name"
@@ -376,7 +388,7 @@ cmd_rm() {
     die "'$name' is the active profile — switch away first (swappy next)"
   fi
   rm -rf "${PROFILES_DIR:?}/${name:?}"
-  state_update remove "$name"
+  state_update remove "$name" || die "failed to update state file $STATE_FILE"
   printf "removed '%s'\n" "$name"
 }
 
@@ -397,7 +409,7 @@ main() {
     *)
       # bare profile name is shorthand for `use`
       if [ -f "$PROFILES_DIR/$cmd/credentials.json" ]; then
-        cmd_use "$cmd"
+        cmd_use "$cmd" "$@"
       else
         die "unknown command '$cmd' (and no such profile). try: swappy help"
       fi

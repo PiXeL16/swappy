@@ -206,3 +206,31 @@ PY
   [[ "$output" == *"corrupt"* ]]
   [[ "$output" == *"swappy save"* ]]
 }
+
+@test "bare profile name shorthand accepts --force" {
+  save_two_profiles
+  simulate_login uuid-gamma-3333 gamma@example.com '{"claudeAiOauth":{"accessToken":"gamma"}}'
+  run "$SWAPPY" alpha --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"switched to alpha"* ]]
+}
+
+@test "re-save refuses when the profile holds a different account" {
+  "$SWAPPY" save alpha
+  simulate_login uuid-beta-2222 beta@example.com "$TOKEN_B"
+  run "$SWAPPY" save alpha
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"different account"* ]]
+  # alpha's original token was not destroyed
+  [ "$(cat "$HOME/.config/swappy/profiles/alpha/credentials.json")" = "$TOKEN_A" ]
+}
+
+@test "save fails loudly when the state file cannot be written" {
+  "$SWAPPY" save alpha
+  chmod 444 "$HOME/.config/swappy/state.json"
+  simulate_login uuid-beta-2222 beta@example.com "$TOKEN_B"
+  run "$SWAPPY" save beta
+  chmod 644 "$HOME/.config/swappy/state.json"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"state"* ]]
+}

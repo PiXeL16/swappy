@@ -1,0 +1,18 @@
+# ABOUTME: CI for swappy — runs the full bats suite on Linux (file backend)
+# ABOUTME: and macOS (file + real temporary keychain backends).
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  bats:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats-core
+        run: sudo npm install -g bats
+      - name: Run tests
+        run: bats test/

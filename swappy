@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# ABOUTME: swappy — tiny Claude Code account rotator. Snapshots logins and swaps the live
+# ABOUTME: credential (macOS keychain / Linux credentials file) plus the identity in ~/.claude.json.
+set -u -o pipefail
+
+SWAPPY_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/swappy"
+STATE_FILE="$SWAPPY_DIR/state.json"
+PROFILES_DIR="$SWAPPY_DIR/profiles"
+BACKUP_DIR="$SWAPPY_DIR/backup"
+CLAUDE_JSON="$HOME/.claude.json"
+CREDS_FILE="$HOME/.claude/.credentials.json"
+KEYCHAIN_SERVICE="Claude Code-credentials"
+# SWAPPY_KEYCHAIN (tests only): extra keychain path appended to every `security` call
+# SWAPPY_BACKEND (tests only): force "keychain" or "file" instead of auto-detection
+
+die() { printf 'swappy: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage: swappy <command> [args]
+
+  save <name>   snapshot the currently logged-in account as a profile
+  use <name>    switch to a saved profile (shorthand: swappy <name>)
+  next          rotate to the next profile in order (wraps around)
+  ls            list profiles, marking the active one
+  rm <name>     delete a saved profile
+  help          show this message
+EOF
+}
+
+# ---------- profile names ----------
+
+RESERVED_NAMES="save use next ls rm help"
+
+validate_name() {
+  local name="${1:-}"
+  [[ "$name" =~ ^[a-z0-9_-]+$ ]] || die "invalid profile name '${name}' (allowed: a-z 0-9 _ -)"
+  local reserved
+  for reserved in $RESERVED_NAMES; do
+    [ "$name" = "$reserved" ] && die "'${name}' is a reserved command word"
+  done
+  return 0
+}
+
+# ---------- live credential backends ----------
+
+detect_backend() {
+  if [ -n "${SWAPPY_BACKEND:-}" ]; then
+    printf '%s' "$SWAPPY_BACKEND"
+    return 0
+  fi
+  case "$(uname)" in
+    Darwin)
+      if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1; then
+        printf 'keychain'
+      elif [ -f "$CREDS_FILE" ]; then
+        printf 'file'
+      else
+        printf 'none'
+      fi
+      ;;
+    *)
+      if [ -f "$CREDS_FILE" ]; then
+        printf 'file'
+      else
+        printf 'none'
+      fi
+      ;;
+  esac
+}
+
+require_backend() {
+  BACKEND="$(detect_backend)"
+  if [ -z "$BACKEND" ] || [ "$BACKEND" = "none" ]; then
+    die "no Claude Code login found — checked keychain item '$KEYCHAIN_SERVICE' (macOS) and $CREDS_FILE. swappy only manages OAuth logins (claude /login), not API keys."
+  fi
+}
+
+live_creds_read() {
+  case "$BACKEND" in
+    keychain)
+      security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
+      ;;
+    file)
+      cat "$CREDS_FILE"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+live_creds_write() {
+  local secret="$1" tmp
+  case "$BACKEND" in
+    keychain)
+      security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$secret" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
+      ;;
+    file)
+      tmp="$(mktemp "$(dirname "$CREDS_FILE")/.credentials.XXXXXX")" || return 1
+      printf '%s' "$secret" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CREDS_FILE"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------- JSON helpers (python3 stdlib only; values cross via env, never interpolated) ----------
+
+# Print the live identity {userID, oauthAccount, savedAt} from ~/.claude.json.
+read_live_identity() {
+  [ -f "$CLAUDE_JSON" ] || return 1
+  python3 - "$CLAUDE_JSON" <<'PY'
+import datetime, json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+account = data.get("oauthAccount")
+if not account or not account.get("accountUuid"):
+    sys.exit(1)
+print(json.dumps({
+    "userID": data.get("userID"),
+    "oauthAccount": account,
+    "savedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}, indent=2))
+PY
+}
+
+# Replace ONLY oauthAccount + userID in ~/.claude.json, atomically, preserving everything else.
+identity_swap() { # $1 = path to identity.json
+  SWAPPY_IDENTITY_FILE="$1" SWAPPY_CLAUDE_JSON="$CLAUDE_JSON" python3 <<'PY'
+import json, os, tempfile
+with open(os.environ["SWAPPY_IDENTITY_FILE"]) as f:
+    ident = json.load(f)
+path = os.environ["SWAPPY_CLAUDE_JSON"]
+with open(path) as f:
+    data = json.load(f)
+data["oauthAccount"] = ident["oauthAccount"]
+data["userID"] = ident["userID"]
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".claude.json.swappy.")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+except BaseException:
+    os.unlink(tmp)
+    raise
+PY
+}
+
+identity_field() { # $1 = identity.json path, $2 = oauthAccount field
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    ident = json.load(f)
+print(ident.get("oauthAccount", {}).get(sys.argv[2], ""))
+PY
+}
+
+# ---------- state ----------
+
+state_init() {
+  umask 077
+  mkdir -p "$SWAPPY_DIR" "$PROFILES_DIR" "$BACKUP_DIR"
+  chmod 700 "$SWAPPY_DIR"
+  [ -f "$STATE_FILE" ] || printf '{"version": 1, "active": null, "order": []}\n' >"$STATE_FILE"
+}
+
+state_check() {
+  [ -f "$STATE_FILE" ] || return 1
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$STATE_FILE" 2>/dev/null
+}
+
+require_state() {
+  if [ -f "$STATE_FILE" ] && ! state_check; then
+    die "state file $STATE_FILE is corrupt. Fix or delete it, then re-register profiles with 'swappy save <name>' (profile snapshots in $PROFILES_DIR are untouched)."
+  fi
+}
+
+state_get() { # active | order
+  [ -f "$STATE_FILE" ] || return 0
+  python3 - "$STATE_FILE" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+if sys.argv[2] == "active":
+    print(state.get("active") or "")
+else:
+    print("\n".join(state.get("order", [])))
+PY
+}
+
+state_update() { # $1 = active|add|remove, $2 = name
+  SWAPPY_OP="$1" SWAPPY_NAME="$2" python3 - "$STATE_FILE" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+with open(path) as f:
+    state = json.load(f)
+op, name = os.environ["SWAPPY_OP"], os.environ["SWAPPY_NAME"]
+if op == "add":
+    if name not in state["order"]:
+        state["order"].append(name)
+    state["active"] = name
+elif op == "active":
+    state["active"] = name
+elif op == "remove":
+    state["order"] = [n for n in state["order"] if n != name]
+    if state.get("active") == name:
+        state["active"] = None
+with open(path, "w") as f:
+    json.dump(state, f, indent=2)
+PY
+}
+
+# ---------- commands ----------
+
+cmd_save() {
+  local name="${1:-}"
+  validate_name "$name"
+  require_backend
+  local secret identity live_uuid
+  secret="$(live_creds_read)" || die "could not read the live credential (backend: $BACKEND)"
+  [ -n "$secret" ] || die "live credential is empty (backend: $BACKEND)"
+  identity="$(read_live_identity)" || die "no oauthAccount in $CLAUDE_JSON — log in with 'claude' first (swappy only manages OAuth logins)"
+  live_uuid="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
+
+  require_state
+  state_init
+
+  # The same account may not hide under two names.
+  local existing
+  for existing in $(state_get order); do
+    [ "$existing" = "$name" ] && continue
+    if [ -f "$PROFILES_DIR/$existing/identity.json" ]; then
+      local existing_uuid
+      existing_uuid="$(identity_field "$PROFILES_DIR/$existing/identity.json" accountUuid)"
+      if [ "$existing_uuid" = "$live_uuid" ]; then
+        die "this account is already saved as '$existing' — use 'swappy use $existing' or 'swappy rm $existing' first"
+      fi
+    fi
+  done
+
+  umask 077
+  mkdir -p "$PROFILES_DIR/$name"
+  chmod 700 "$PROFILES_DIR/$name"
+  printf '%s' "$secret" >"$PROFILES_DIR/$name/credentials.json"
+  printf '%s\n' "$identity" >"$PROFILES_DIR/$name/identity.json"
+  chmod 600 "$PROFILES_DIR/$name/credentials.json" "$PROFILES_DIR/$name/identity.json"
+  state_update add "$name"
+  printf "saved '%s' (%s)\n" "$name" "$(identity_field "$PROFILES_DIR/$name/identity.json" emailAddress)"
+}
+
+cmd_ls() {
+  require_state
+  local order
+  order="$(state_get order)"
+  if [ -z "$order" ]; then
+    printf 'no profiles saved yet. run: swappy save <name>\n'
+    return 0
+  fi
+  local active name marker email
+  active="$(state_get active)"
+  for name in $order; do
+    marker=' '
+    [ "$name" = "$active" ] && marker='*'
+    email="$(identity_field "$PROFILES_DIR/$name/identity.json" emailAddress 2>/dev/null || printf '?')"
+    printf '%s %-16s %s\n' "$marker" "$name" "$email"
+  done
+}
+
+require_profile() { # $1 = name; dies with the valid list if missing
+  local name="$1"
+  if [ ! -f "$PROFILES_DIR/$name/credentials.json" ] || [ ! -f "$PROFILES_DIR/$name/identity.json" ]; then
+    local known
+    known="$(state_get order | tr '\n' ' ')"
+    die "no profile named '$name'. saved profiles: ${known:-<none>}"
+  fi
+}
+
+cmd_use() {
+  local name="" force=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      *) name="$arg" ;;
+    esac
+  done
+  validate_name "$name"
+  require_state
+  require_profile "$name"
+  require_backend
+
+  local live_secret live_identity live_uuid
+  live_secret="$(live_creds_read)" || die "could not read the live credential (backend: $BACKEND)"
+  live_identity="$(read_live_identity)" || die "no oauthAccount in $CLAUDE_JSON — log in with 'claude' first"
+  live_uuid="$(printf '%s' "$live_identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
+
+  # Drift reconciliation: Claude Code rotates OAuth tokens while an account is active.
+  # Re-snapshot the live credential into whichever saved profile owns it, so switching
+  # back later restores a token that still works.
+  local owner="" p uuid
+  for p in $(state_get order); do
+    [ -f "$PROFILES_DIR/$p/identity.json" ] || continue
+    uuid="$(identity_field "$PROFILES_DIR/$p/identity.json" accountUuid)"
+    if [ "$uuid" = "$live_uuid" ]; then
+      owner="$p"
+      break
+    fi
+  done
+  if [ -n "$owner" ]; then
+    umask 077
+    printf '%s' "$live_secret" >"$PROFILES_DIR/$owner/credentials.json"
+    printf '%s\n' "$live_identity" >"$PROFILES_DIR/$owner/identity.json"
+    chmod 600 "$PROFILES_DIR/$owner/credentials.json" "$PROFILES_DIR/$owner/identity.json"
+    [ "$(state_get active)" = "$owner" ] || state_update active "$owner"
+  elif [ "$force" -ne 1 ]; then
+    local live_email
+    live_email="$(printf '%s' "$live_identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"].get("emailAddress",""))')"
+    die "current account ($live_email) isn't saved — 'swappy save <name>' it first, or add --force to discard its login"
+  fi
+
+  if [ "$owner" = "$name" ]; then
+    printf "already on '%s'\n" "$name"
+    return 0
+  fi
+
+  umask 077
+  mkdir -p "$BACKUP_DIR"
+  printf '%s' "$live_secret" >"$BACKUP_DIR/prev-credentials.json"
+  cp "$CLAUDE_JSON" "$BACKUP_DIR/claude.json.bak"
+  chmod 600 "$BACKUP_DIR/prev-credentials.json" "$BACKUP_DIR/claude.json.bak"
+
+  local target_secret
+  target_secret="$(cat "$PROFILES_DIR/$name/credentials.json")"
+  live_creds_write "$target_secret" || die "failed to write the live credential (backend: $BACKEND) — nothing changed"
+  if ! identity_swap "$PROFILES_DIR/$name/identity.json" 2>/dev/null; then
+    if ! live_creds_write "$live_secret"; then
+      die "identity swap of $CLAUDE_JSON failed AND rolling the credential back failed — restore manually from $BACKUP_DIR"
+    fi
+    die "identity swap of $CLAUDE_JSON failed — rolled the live credential back, nothing changed"
+  fi
+  state_update active "$name"
+  printf "switched to %s (%s)\n" "$name" "$(identity_field "$PROFILES_DIR/$name/identity.json" emailAddress)"
+  if pgrep -x claude >/dev/null 2>&1; then
+    printf 'note: running claude sessions keep the previous token in memory — new sessions use %s\n' "$name"
+  fi
+}
+
+cmd_next() {
+  require_state
+  local order active
+  order="$(state_get order)"
+  [ -n "$order" ] || die "no profiles saved yet. run: swappy save <name>"
+  local count
+  count="$(printf '%s\n' "$order" | wc -l | tr -d ' ')"
+  if [ "$count" -le 1 ]; then
+    printf 'only one profile saved — nothing to rotate to\n'
+    return 0
+  fi
+  active="$(state_get active)"
+  local target="" first="" seen_active=0 p
+  for p in $order; do
+    [ -z "$first" ] && first="$p"
+    if [ "$seen_active" -eq 1 ]; then
+      target="$p"
+      break
+    fi
+    [ "$p" = "$active" ] && seen_active=1
+  done
+  [ -z "$target" ] && target="$first"
+  cmd_use "$target"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  validate_name "$name"
+  require_state
+  require_profile "$name"
+  if [ "$(state_get active)" = "$name" ]; then
+    die "'$name' is the active profile — switch away first (swappy next)"
+  fi
+  rm -rf "${PROFILES_DIR:?}/${name:?}"
+  state_update remove "$name"
+  printf "removed '%s'\n" "$name"
+}
+
+# ---------- dispatch ----------
+
+main() {
+  [ $# -ge 1 ] || { usage >&2; exit 1; }
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    save) cmd_save "$@" ;;
+    use) cmd_use "$@" ;;
+    next) cmd_next "$@" ;;
+    ls | list | status) cmd_ls "$@" ;;
+    rm) cmd_rm "$@" ;;
+    help | -h | --help) usage ;;
+    -*) usage >&2; die "unknown command '$cmd'" ;;
+    *)
+      # bare profile name is shorthand for `use`
+      if [ -f "$PROFILES_DIR/$cmd/credentials.json" ]; then
+        cmd_use "$cmd"
+      else
+        die "unknown command '$cmd' (and no such profile). try: swappy help"
+      fi
+      ;;
+  esac
+}
+
+main "$@"

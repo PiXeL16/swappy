@@ -1,0 +1,32 @@
+{
+  "installMethod": "native",
+  "autoUpdates": true,
+  "numStartups": 42,
+  "userID": "user-alpha-111",
+  "tipsHistory": {
+    "terminal-setup": 5,
+    "shift-enter": 12
+  },
+  "projects": {
+    "/home/someone/code/demo": {
+      "allowedTools": ["Bash(ls:*)"],
+      "history": [
+        {"display": "decoy history entry that must survive every switch", "pastedContents": {}}
+      ],
+      "mcpServers": {},
+      "hasTrustDialogAccepted": true
+    }
+  },
+  "oauthAccount": {
+    "accountUuid": "uuid-alpha-0000-1111",
+    "emailAddress": "alpha@example.com",
+    "organizationUuid": "org-uuid-alpha",
+    "organizationName": "Alpha Org",
+    "organizationType": "claude_team",
+    "organizationRole": "admin",
+    "workspaceRole": null,
+    "displayName": "Alpha Person",
+    "billingType": "stripe_subscription",
+    "seatTier": "team_tier_1"
+  }
+}

@@ -128,6 +128,58 @@ PY
   [ "$(read_live_secret)" = "$TOKEN_A" ]
 }
 
+@test "use restores a profile when nobody is logged in" {
+  save_two_profiles
+  logout_live
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"switched to alpha"* ]]
+  [ "$(read_live_secret)" = "$TOKEN_A" ]
+  [ "$(json_get "$HOME/.claude.json" oauthAccount.accountUuid)" = "uuid-alpha-0000-1111" ]
+  [ "$(json_get "$HOME/.claude.json" userID)" = "user-alpha-111" ]
+  [ "$(json_get "$HOME/.config/swappy/state.json" active)" = "alpha" ]
+}
+
+@test "next rotates when nobody is logged in" {
+  save_two_profiles
+  logout_live
+  run "$SWAPPY" next
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"switched to alpha"* ]]
+  [ "$(read_live_secret)" = "$TOKEN_A" ]
+}
+
+@test "use keeps a profile's token when the live credential is gone but its identity lingers" {
+  save_two_profiles           # live account is beta
+  remove_live_secret          # credential store emptied; ~/.claude.json still names beta
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 0 ]
+  # beta's snapshot is the only copy of its token left — re-snapshotting an absent
+  # credential over it would destroy the account for good
+  [ "$(cat "$HOME/.config/swappy/profiles/beta/credentials.json")" = "$TOKEN_B" ]
+  [ "$(read_live_secret)" = "$TOKEN_A" ]
+}
+
+@test "use works with no ~/.claude.json at all" {
+  save_two_profiles
+  logout_live
+  rm -f "$HOME/.claude.json"
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 0 ]
+  [ "$(json_get "$HOME/.claude.json" oauthAccount.emailAddress)" = "alpha@example.com" ]
+  [ "$(read_live_secret)" = "$TOKEN_A" ]
+}
+
+@test "save still refuses when nobody is logged in" {
+  save_two_profiles
+  logout_live
+  run "$SWAPPY" save alpha
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no Claude Code login found"* ]]
+  # the existing snapshot survives the refusal
+  [ "$(cat "$HOME/.config/swappy/profiles/alpha/credentials.json")" = "$TOKEN_A" ]
+}
+
 @test "use backs up the replaced live secret" {
   save_two_profiles
   "$SWAPPY" use alpha
@@ -158,6 +210,16 @@ PY
   [[ "$output" == *"switched to beta"* ]]
   run "$SWAPPY" next            # beta -> gamma
   [[ "$output" == *"switched to gamma"* ]]
+}
+
+@test "next rotates off the live account, not a stale state file" {
+  save_two_profiles
+  "$SWAPPY" use alpha                                          # state: active=alpha, live=alpha
+  simulate_login uuid-beta-2222 beta@example.com "$TOKEN_B"    # `claude /login` behind swappy's back
+  run "$SWAPPY" next                                           # live is beta, so next is alpha (wrap)
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"switched to alpha"* ]]
+  [ "$(read_live_secret)" = "$TOKEN_A" ]
 }
 
 @test "next with a single profile says so and exits 0" {

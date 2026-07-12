@@ -87,6 +87,11 @@ against your saved profiles and re-snapshots the current token back into its pro
 Switching back later therefore restores a fresh token, not a stale one. This is the part that
 makes naive "copy the credentials file around" approaches break after a day.
 
+Re-snapshotting only ever happens with a credential in hand, and a switch never requires one:
+if Claude Code has no live login (you ran `/logout`, or it dropped the keychain item), `swappy
+use` and `swappy next` simply restore the profile you asked for. Rotation follows the account
+that is *actually* live, so logging in by hand behind swappy's back doesn't desync it.
+
 Profiles and state live in `${XDG_CONFIG_HOME:-~/.config}/swappy/`. The last-replaced live
 credential and a pre-swap copy of `~/.claude.json` are kept in `backup/` there.
 
@@ -108,8 +113,8 @@ Know what this tool does before using it:
 - OAuth logins only, verified against Claude Code 2.1.x credential locations. If Anthropic
   moves the credential store, `swappy save` will tell you it can't find a login rather than
   guessing.
-- swappy switches *between* logins; it can't restore one after `/logout` has deleted the
-  credential store entirely. If you logged out, `/login` to any account and switch from there.
+- swappy can only rotate between accounts you have saved. It never invents a login: if a
+  profile's saved token has expired past refresh, that account needs a real `/login` again.
 
 ## Development
 

@@ -60,6 +60,31 @@ write_live_secret() {
   fi
 }
 
+# Delete the live credential, leaving ~/.claude.json alone (simulates Claude Code dropping
+# the keychain item while its stale identity lingers).
+remove_live_secret() {
+  if [ "${SWAPPY_BACKEND:-}" = "keychain" ]; then
+    security delete-generic-password -s "Claude Code-credentials" -a "$USER" "$TEST_KEYCHAIN" >/dev/null 2>&1 || true
+  else
+    rm -f "$HOME/.claude/.credentials.json"
+  fi
+}
+
+# Simulate `/logout`: no live credential and no identity left in ~/.claude.json.
+logout_live() {
+  remove_live_secret
+  python3 - "$HOME/.claude.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+data.pop("oauthAccount", None)
+data.pop("userID", None)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+}
+
 # Simulate `/login` to a different account: new live secret + new identity in ~/.claude.json.
 simulate_login() { # uuid email token
   write_live_secret "$3"

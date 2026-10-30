@@ -122,3 +122,44 @@ for key in sys.argv[2].split("."):
 print(data)
 PY
 }
+
+# ---------- observe / usage endpoint stub ----------
+
+# A real local http.server standing in for the usage endpoint (SWAPPY_USAGE_URL is tests only).
+# Responses are read from $STUB_DIR/status + $STUB_DIR/body on every request, so a test can change
+# them between ticks. Every request is appended to $STUB_DIR/requests.log.
+start_usage_stub() {
+  STUB_DIR="$TEST_HOME/stub"
+  mkdir -p "$STUB_DIR"
+  stub_respond 200 '{}'
+  python3 "$BATS_TEST_DIRNAME/fixtures/usage_stub.py" "$STUB_DIR" >/dev/null 2>&1 &
+  STUB_PID=$!
+  local i
+  for i in $(seq 1 100); do
+    [ -s "$STUB_DIR/port" ] && break
+    sleep 0.1
+  done
+  [ -s "$STUB_DIR/port" ] || { echo "usage stub failed to start" >&2; return 1; }
+  export SWAPPY_USAGE_URL="http://127.0.0.1:$(cat "$STUB_DIR/port")/api/oauth/usage"
+}
+
+stop_usage_stub() {
+  if [ -n "${STUB_PID:-}" ]; then
+    kill "$STUB_PID" 2>/dev/null || true
+    wait "$STUB_PID" 2>/dev/null || true
+    STUB_PID=""
+  fi
+}
+
+stub_respond() { # status body
+  printf '%s' "$1" > "$STUB_DIR/status"
+  printf '%s' "$2" > "$STUB_DIR/body"
+}
+
+# Body in the endpoint's shape: five_hour / seven_day utilization (0-100) + ISO resets_at.
+usage_body() { # pct5 pct7
+  printf '{"five_hour":{"utilization":%s,"resets_at":"2099-01-01T05:00:00.123456+00:00"},"seven_day":{"utilization":%s,"resets_at":"2099-01-05T00:00:00Z"}}' "$1" "$2"
+}
+
+live_uuid() { json_get "$HOME/.claude.json" oauthAccount.accountUuid; }
+observe_log() { cat "$HOME/.config/swappy/observe.log" 2>/dev/null || true; }

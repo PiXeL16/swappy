@@ -18,6 +18,7 @@ test/helpers.bash         scratch-$HOME + throwaway-keychain plumbing
 test/fixtures/claude.json realistic ~/.claude.json with decoy keys that must survive switches
 test/unit.bats            arg parsing, validation, error paths
 test/integration.bats     save/use/next/rm mechanics on the file backend (any OS)
+test/observe.bats         usage + observe against a real local HTTP stub (test/fixtures/usage_stub.py)
 test/e2e.bats             full journey on the platform's real backend (temp keychain on macOS)
 ```
 

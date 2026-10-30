@@ -296,3 +296,36 @@ PY
   [ "$status" -eq 1 ]
   [[ "$output" == *"state"* ]]
 }
+
+@test "use refuses while a fresh switch lock is held, and leaves everything alone" {
+  save_two_profiles
+  mkdir "$HOME/.config/swappy/switch.lock"
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"in progress"* ]]
+  [ "$(read_live_secret)" = "$TOKEN_B" ]
+  [ -d "$HOME/.config/swappy/switch.lock" ]
+}
+
+@test "use overrides a stale switch lock" {
+  save_two_profiles
+  mkdir "$HOME/.config/swappy/switch.lock"
+  touch -t 200001010000 "$HOME/.config/swappy/switch.lock"
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 0 ]
+  [ "$(read_live_secret)" = "$TOKEN_A" ]
+}
+
+@test "use releases the switch lock on success and on failure" {
+  save_two_profiles
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 0 ]
+  [ ! -e "$HOME/.config/swappy/switch.lock" ]
+  run "$SWAPPY" use nope
+  [ "$status" -eq 1 ]
+  [ ! -e "$HOME/.config/swappy/switch.lock" ]
+  simulate_login uuid-stranger-9 stranger@example.com '{"claudeAiOauth":{"accessToken":"s"}}'
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 1 ]
+  [ ! -e "$HOME/.config/swappy/switch.lock" ]
+}

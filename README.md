@@ -166,9 +166,16 @@ Know what this tool does before using it:
 bats test/          # unit + integration + e2e
 ```
 
-`SWAPPY_KEYCHAIN`, `SWAPPY_BACKEND`, `SWAPPY_USAGE_URL`, `SWAPPY_OBSERVE_UNIT_DIR`, `SWAPPY_NO_NOTIFY` and
-`SWAPPY_OBSERVE_INTERVAL` / `SWAPPY_OBSERVE_MAX_TICKS` are test-only environment variables (see the top of
-`swappy`). `SWAPPY_USAGE_URL` receives your bearer token, so never set it to anything you do not control.
+`SWAPPY_TEST`, `SWAPPY_KEYCHAIN`, `SWAPPY_BACKEND`, `SWAPPY_USAGE_URL`, `SWAPPY_OBSERVE_UNIT_DIR`,
+`SWAPPY_NO_NOTIFY` and `SWAPPY_OBSERVE_INTERVAL` / `SWAPPY_OBSERVE_MAX_TICKS` are test-only environment
+variables (see the top of `swappy`). `SWAPPY_USAGE_URL` is ignored unless `SWAPPY_TEST` is also set
+(`test/helpers.bash` sets it), and only `http(s)` URLs are accepted; in normal use swappy always queries
+`https://api.anthropic.com/api/oauth/usage`. It receives your bearer token, so never point it at anything
+you do not control.
+
+The scheduled job runs with a fixed `PATH` (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`),
+not the one you installed it from, and a private umask. On HTTP 429 the observer backs off (honoring
+`Retry-After`, default 30 minutes, at most 6 hours) and never switches on an error.
 
 Tests run against a scratch `$HOME` and, on macOS, a real throwaway keychain. They never touch
 your login keychain or your real `~/.claude.json`. See `CLAUDE.md` for contributor conventions.

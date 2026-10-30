@@ -16,6 +16,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "path": self.path,
                 "auth": self.headers.get("Authorization"),
                 "beta": self.headers.get("anthropic-beta"),
+                # was swappy's switch lock held while this request was in flight?
+                "lock": os.path.isdir(open(os.path.join(DIR, "lockpath")).read().strip()),
             }) + "\n")
         # Snapshot every process's argv while swappy's request is in flight, so tests can
         # prove the bearer token never appears on a command line.
@@ -28,6 +30,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = f.read()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        with open(os.path.join(DIR, "headers")) as f:
+            for line in f.read().splitlines():
+                if ": " in line:
+                    k, v = line.split(": ", 1)
+                    self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

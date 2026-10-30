@@ -112,7 +112,7 @@ PY
   [ "$status" -eq 0 ]
   [ "$(live_uuid)" = "uuid-alpha-0000-1111" ]
   [ "$(read_live_secret)" = "$TOKEN_A" ]
-  [[ "$(observe_log)" == *"50"* ]]
+  [[ "$(show_observe_log)" == *"50"* ]]
   [ -f "$HOME/.config/swappy/observe.json" ]
   [ -n "$(json_get "$HOME/.config/swappy/observe.json" last_run.at)" ]
 }
@@ -124,7 +124,7 @@ PY
   [ "$status" -eq 0 ]
   [ "$(live_uuid)" = "uuid-beta-2222" ]
   [ "$(read_live_secret)" = "$TOKEN_B" ]
-  [ "$(json_get "$HOME/.config/swappy/observe.json" exhausted.alpha)" = "2099-01-01T05:00:00Z" ]
+  [ "$(json_get "$HOME/.config/swappy/observe.json" exhausted.alpha)" = "$R5" ]
   # the token we sent is the only thing the endpoint ever saw: no refresh endpoint, no other path
   ! grep -v '"path": "/api/oauth/usage"' "$STUB_DIR/requests.log"
 }
@@ -135,7 +135,7 @@ PY
   run "$SWAPPY" observe --tick
   [ "$status" -eq 0 ]
   [ "$(live_uuid)" = "uuid-beta-2222" ]
-  [ "$(json_get "$HOME/.config/swappy/observe.json" exhausted.alpha)" = "2099-01-05T00:00:00Z" ]
+  [ "$(json_get "$HOME/.config/swappy/observe.json" exhausted.alpha)" = "$R7" ]
 }
 
 @test "exhausted_until covers the latest reset when both windows are over" {
@@ -143,7 +143,7 @@ PY
   stub_respond 200 "$(usage_body 95 95)"
   run "$SWAPPY" observe --tick
   [ "$status" -eq 0 ]
-  [ "$(json_get "$HOME/.config/swappy/observe.json" exhausted.alpha)" = "2099-01-05T00:00:00Z" ]
+  [ "$(json_get "$HOME/.config/swappy/observe.json" exhausted.alpha)" = "$R7" ]
 }
 
 @test "--t5 and --t7 override the default threshold" {
@@ -183,10 +183,10 @@ PY
   [ "$status" -eq 0 ]
   [ "$(live_uuid)" = "uuid-alpha-0000-1111" ]
   [ "$(json_get "$HOME/.config/swappy/observe.json" notified)" = "True" ]
-  [[ "$(observe_log)" == *"exhausted"* ]]
+  [[ "$(show_observe_log)" == *"exhausted"* ]]
   run "$SWAPPY" observe --tick
   [ "$status" -eq 0 ]
-  [[ "$(observe_log)" == *"already notified"* ]]
+  [[ "$(show_observe_log)" == *"already notified"* ]]
 }
 
 @test "never writes the token to the observe log" {
@@ -221,17 +221,18 @@ PY
 @test "tick never switches on bad data or HTTP errors, and always exits 0" {
   two_profiles
   local bad
-  for bad in "401|{}" "429|{}" "500|{}" "200|garbage" "200|{}" \
+  for bad in "401|{}" "500|{}" "200|garbage" "200|{}" \
              '200|{"five_hour":null,"seven_day":null}' \
-             '200|{"five_hour":{"utilization":"lots","resets_at":null},"seven_day":null}'; do
+             '200|{"five_hour":{"utilization":"lots","resets_at":null},"seven_day":null}' \
+             "429|{}"; do
     stub_respond "${bad%%|*}" "${bad#*|}"
     run "$SWAPPY" observe --tick
     [ "$status" -eq 0 ]
     [ "$(live_uuid)" = "uuid-alpha-0000-1111" ]
     [ "$(read_live_secret)" = "$TOKEN_A" ]
   done
-  [[ "$(observe_log)" == *"401"* ]]
-  [[ "$(observe_log)" == *"429"* ]]
+  [[ "$(show_observe_log)" == *"401"* ]]
+  [[ "$(show_observe_log)" == *"429"* ]]
 }
 
 @test "tick never switches when the endpoint is unreachable" {
@@ -244,7 +245,7 @@ PY
 
 @test "tick with one window null still acts on the other" {
   two_profiles
-  stub_respond 200 '{"five_hour":null,"seven_day":{"utilization":97,"resets_at":"2099-01-05T00:00:00Z"}}'
+  stub_respond 200 "{\"five_hour\":null,\"seven_day\":{\"utilization\":97,\"resets_at\":\"$R7\"}}"
   run "$SWAPPY" observe --tick
   [ "$status" -eq 0 ]
   [ "$(live_uuid)" = "uuid-beta-2222" ]
@@ -257,7 +258,7 @@ PY
   run "$SWAPPY" observe --tick
   [ "$status" -eq 0 ]
   [ "$(live_uuid)" = "uuid-alpha-0000-1111" ]
-  [[ "$(observe_log)" == *"lock"* ]]
+  [[ "$(show_observe_log)" == *"lock"* ]]
 }
 
 @test "tick aborts when the live token belongs to a different saved profile than ~/.claude.json names" {
@@ -268,7 +269,7 @@ PY
   [ "$status" -eq 0 ]
   [ "$(live_uuid)" = "uuid-alpha-0000-1111" ]
   [ "$(read_live_secret)" = "$TOKEN_B" ]
-  [[ "$(observe_log)" == *"identity"* ]]
+  [[ "$(show_observe_log)" == *"identity"* ]]
   # no token was sent anywhere before the identity check passed
   [ ! -e "$STUB_DIR/requests.log" ]
   # the profile snapshots were not overwritten with the wrong token
@@ -283,7 +284,7 @@ PY
   [ "$status" -eq 0 ]
   [ "$(live_uuid)" = "uuid-stranger-9" ]
   [ "$(read_live_secret)" = '{"claudeAiOauth":{"accessToken":"access-s"}}' ]
-  [[ "$(observe_log)" == *"not saved"* ]]
+  [[ "$(show_observe_log)" == *"not saved"* ]]
 }
 
 @test "tick with no login or no profiles does nothing and exits 0" {
@@ -415,4 +416,156 @@ job_files() {
   done
   run "$SWAPPY" observe --off
   [ "$status" -eq 0 ]
+}
+
+# ---------- hardening: usage URL, lock, PATH, umask, log hygiene, clamping, 429 backoff ----------
+
+@test "SWAPPY_USAGE_URL is ignored unless the tests-only flag is set" {
+  run env -u SWAPPY_TEST SWAPPY_USAGE_URL=http://127.0.0.1:1/x bash -c 'source "$1"; printf %s "$USAGE_URL"' _ "$SWAPPY"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://api.anthropic.com/api/oauth/usage" ]
+  run env SWAPPY_TEST=1 SWAPPY_USAGE_URL=http://127.0.0.1:1/x bash -c 'source "$1"; printf %s "$USAGE_URL"' _ "$SWAPPY"
+  [ "$output" = "http://127.0.0.1:1/x" ]
+}
+
+@test "SWAPPY_USAGE_URL with a non-http(s) scheme is rejected even in test mode" {
+  run env SWAPPY_TEST=1 SWAPPY_USAGE_URL=file:///etc/passwd bash "$SWAPPY" usage
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"http"* ]]
+}
+
+@test "the job never bakes in the caller's PATH" {
+  PATH="$PATH:/canary-path-8841/bin" run "$SWAPPY" observe
+  [ "$status" -eq 0 ]
+  local f
+  for f in $(job_files); do
+    ! grep -q 'canary-path-8841' "$f"
+    grep -q '/usr/bin:/bin' "$f"
+    grep -q '/opt/homebrew/bin' "$f"
+  done
+}
+
+@test "install creates the swappy dir private and the plist asks launchd for umask 077" {
+  rm -rf "$HOME/.config"
+  run "$SWAPPY" observe
+  [ "$status" -eq 0 ]
+  [ "$(file_mode "$HOME/.config/swappy")" = "700" ]
+  if [ "$(uname)" = "Darwin" ]; then
+    python3 - "$SWAPPY_OBSERVE_UNIT_DIR/com.swappy.observe.plist" <<'PY'
+import plistlib, sys
+assert plistlib.load(open(sys.argv[1], "rb"))["Umask"] == 63
+PY
+  fi
+}
+
+@test "systemd text rejects double quotes, backslashes and newlines" {
+  local bad
+  for bad in '/opt/a"b/swappy' '/opt/a\b/swappy' "$(printf '/opt/a\nb/swappy')"; do
+    run bash -c 'source "$1"; observe_service_text "$2" /usr/bin 80 70' _ "$SWAPPY" "$bad"
+    [ "$status" -ne 0 ]
+  done
+}
+
+@test "observe.log records profile names only: no email, no raw stderr" {
+  two_profiles
+  stub_respond 200 "$(usage_body 99 10)"
+  run "$SWAPPY" observe --tick
+  [ "$status" -eq 0 ]
+  [[ "$(show_observe_log)" == *"alpha -> beta"* ]]
+  ! grep -q '@example.com' "$HOME/.config/swappy/observe.log"
+  # a failing switch logs a short summary, not the cmd_use stderr
+  rm -f "$HOME/.config/swappy/observe.log"
+  "$SWAPPY" use alpha
+  rm -f "$HOME/.config/swappy/profiles/beta/identity.json"
+  run "$SWAPPY" observe --tick
+  [ "$status" -eq 0 ]
+  [[ "$(show_observe_log)" == *"failed"* ]]
+  ! grep -q 'no profile named' "$HOME/.config/swappy/observe.log"
+  ! grep -q '@example.com' "$HOME/.config/swappy/observe.log"
+}
+
+@test "a past resets_at still marks the account exhausted for at least 15 minutes" {
+  two_profiles
+  stub_respond 200 '{"five_hour":{"utilization":99,"resets_at":"2000-01-01T00:00:00Z"},"seven_day":null}'
+  run "$SWAPPY" observe --tick
+  [ "$status" -eq 0 ]
+  python3 - "$HOME/.config/swappy/observe.json" <<'PY'
+import datetime as d, json, sys
+u = d.datetime.strptime(json.load(open(sys.argv[1]))["exhausted"]["alpha"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc)
+delta = (u - d.datetime.now(d.timezone.utc)).total_seconds()
+assert 14 * 60 <= delta <= 16 * 60, delta
+PY
+}
+
+@test "exhausted_until is capped at 8 days" {
+  two_profiles
+  stub_respond 200 '{"five_hour":{"utilization":99,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":null}'
+  run "$SWAPPY" observe --tick
+  [ "$status" -eq 0 ]
+  python3 - "$HOME/.config/swappy/observe.json" <<'PY'
+import datetime as d, json, sys
+u = d.datetime.strptime(json.load(open(sys.argv[1]))["exhausted"]["alpha"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc)
+delta = (u - d.datetime.now(d.timezone.utc)).total_seconds()
+assert 8 * 86400 - 120 <= delta <= 8 * 86400 + 60, delta
+PY
+}
+
+@test "the tick holds the switch lock while it talks to the endpoint, and releases it after" {
+  two_profiles
+  stub_respond 200 "$(usage_body 10 10)"
+  run "$SWAPPY" observe --tick
+  [ "$status" -eq 0 ]
+  grep -q '"lock": true' "$STUB_DIR/requests.log"
+  [ ! -e "$HOME/.config/swappy/switch.lock" ]
+}
+
+# skip_until helpers
+skip_delta() { # seconds from now until observe.json skip_until
+  python3 - "$HOME/.config/swappy/observe.json" <<'PY'
+import datetime as d, json, sys
+u = d.datetime.strptime(json.load(open(sys.argv[1]))["skip_until"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc)
+print(int((u - d.datetime.now(d.timezone.utc)).total_seconds()))
+PY
+}
+
+@test "HTTP 429 sets skip_until (30 min default), the next ticks no-op, and nothing switches" {
+  two_profiles
+  stub_respond 429 '{}'
+  run "$SWAPPY" observe --tick
+  [ "$status" -eq 0 ]
+  local d
+  d="$(skip_delta)"
+  [ "$d" -ge 1700 ] && [ "$d" -le 1810 ]
+  stub_respond 200 "$(usage_body 99 99)"
+  run "$SWAPPY" observe --tick
+  [ "$status" -eq 0 ]
+  [ "$(live_uuid)" = "uuid-alpha-0000-1111" ]
+  [ "$(grep -c '"path"' "$STUB_DIR/requests.log")" -eq 1 ]
+  [[ "$(show_observe_log)" == *"backing off"* ]]
+}
+
+@test "429 honors Retry-After and caps it at 6 hours" {
+  two_profiles
+  stub_headers "Retry-After: 7200"
+  stub_respond 429 '{}'
+  "$SWAPPY" observe --tick
+  local d
+  d="$(skip_delta)"
+  [ "$d" -ge 7100 ] && [ "$d" -le 7210 ]
+  stub_headers "Retry-After: 999999"
+  python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d.pop("skip_until"); json.dump(d, open(p,"w"))' "$HOME/.config/swappy/observe.json"
+  "$SWAPPY" observe --tick
+  d="$(skip_delta)"
+  [ "$d" -ge 21500 ] && [ "$d" -le 21610 ]
+}
+
+@test "ticks resume once skip_until has passed" {
+  two_profiles
+  stub_respond 429 '{}'
+  "$SWAPPY" observe --tick
+  python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["skip_until"]="2000-01-01T00:00:00Z"; json.dump(d, open(p,"w"))' "$HOME/.config/swappy/observe.json"
+  stub_respond 200 "$(usage_body 99 10)"
+  run "$SWAPPY" observe --tick
+  [ "$status" -eq 0 ]
+  [ "$(live_uuid)" = "uuid-beta-2222" ]
 }

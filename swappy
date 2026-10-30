@@ -13,8 +13,10 @@ KEYCHAIN_SERVICE="Claude Code-credentials"
 KEYCHAIN_ACCOUNT="${USER:-$(id -un)}"
 # SWAPPY_KEYCHAIN (tests only): extra keychain path appended to every `security` call
 # SWAPPY_BACKEND (tests only): force "keychain" or "file" instead of auto-detection
-# SWAPPY_USAGE_URL (tests only): usage endpoint to query instead of Anthropic's. The live bearer
-#   token is sent there, so never point it at anything you do not control.
+# SWAPPY_TEST (tests only): must be set for SWAPPY_USAGE_URL to be honored at all
+# SWAPPY_USAGE_URL (tests only, needs SWAPPY_TEST): http(s) usage endpoint to query instead of
+#   Anthropic's. Ignored without SWAPPY_TEST; any other scheme is rejected. The live bearer token is
+#   sent there, so never point it at anything you do not control.
 # SWAPPY_OBSERVE_UNIT_DIR (tests only): write the launchd plist / systemd units here and skip
 #   launchctl/systemctl entirely
 # SWAPPY_NO_NOTIFY (tests only): never raise a desktop notification
@@ -22,7 +24,19 @@ KEYCHAIN_ACCOUNT="${USER:-$(id -un)}"
 OBSERVE_FILE="$SWAPPY_DIR/observe.json"
 OBSERVE_LOG="$SWAPPY_DIR/observe.log"
 SWITCH_LOCK="$SWAPPY_DIR/switch.lock"
-USAGE_URL="${SWAPPY_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
+USAGE_URL="https://api.anthropic.com/api/oauth/usage"
+if [ -n "${SWAPPY_TEST:-}" ] && [ -n "${SWAPPY_USAGE_URL:-}" ]; then
+  case "$SWAPPY_USAGE_URL" in
+    http://* | https://*) USAGE_URL="$SWAPPY_USAGE_URL" ;;
+    *) printf 'swappy: SWAPPY_USAGE_URL must be an http(s) URL\n' >&2; exit 1 ;;
+  esac
+fi
+# Prefer the absolute system tools: a scheduled job must not resolve them through a PATH it did not choose.
+SECURITY_BIN=security
+[ ! -x /usr/bin/security ] || SECURITY_BIN=/usr/bin/security
+PYTHON3=python3
+[ ! -x /usr/bin/python3 ] || PYTHON3=/usr/bin/python3
+OBSERVE_JOB_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 OBSERVE_LABEL="com.swappy.observe"
 OBSERVE_INTERVAL_SECS=900
 
@@ -74,7 +88,7 @@ detect_backend() {
   case "$(uname)" in
     Darwin)
       if [ -f "$CREDS_FILE" ] && \
-         ! security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1; then
+         ! "$SECURITY_BIN" find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1; then
         printf 'file'
       else
         printf 'keychain'
@@ -93,7 +107,7 @@ no_login_hint() {
 live_creds_read() {
   case "$BACKEND" in
     keychain)
-      security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} 2>/dev/null
+      "$SECURITY_BIN" find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} 2>/dev/null
       ;;
     file)
       [ -f "$CREDS_FILE" ] || return 1
@@ -106,7 +120,7 @@ live_creds_read() {
 live_creds_delete() {
   case "$BACKEND" in
     keychain)
-      security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1
+      "$SECURITY_BIN" delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1
       ;;
     file)
       rm -f "$CREDS_FILE"
@@ -119,7 +133,7 @@ live_creds_write() {
   local secret="$1" tmp
   case "$BACKEND" in
     keychain)
-      security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$secret" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
+      "$SECURITY_BIN" add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$secret" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
       ;;
     file)
       tmp="$(mktemp "$(dirname "$CREDS_FILE")/.credentials.XXXXXX")" || return 1
@@ -134,7 +148,7 @@ live_creds_write() {
 # Print the live identity {userID, oauthAccount, savedAt} from ~/.claude.json.
 read_live_identity() {
   [ -f "$CLAUDE_JSON" ] || return 1
-  python3 - "$CLAUDE_JSON" <<'PY'
+  "$PYTHON3" - "$CLAUDE_JSON" <<'PY'
 import datetime, json, sys
 with open(sys.argv[1]) as f:
     data = json.load(f)
@@ -151,7 +165,7 @@ PY
 
 # Replace ONLY oauthAccount + userID in ~/.claude.json, atomically, preserving everything else.
 identity_swap() { # $1 = path to identity.json
-  SWAPPY_IDENTITY_FILE="$1" SWAPPY_CLAUDE_JSON="$CLAUDE_JSON" python3 <<'PY'
+  SWAPPY_IDENTITY_FILE="$1" SWAPPY_CLAUDE_JSON="$CLAUDE_JSON" "$PYTHON3" <<'PY'
 import json, os, tempfile
 with open(os.environ["SWAPPY_IDENTITY_FILE"]) as f:
     ident = json.load(f)
@@ -174,7 +188,7 @@ PY
 }
 
 identity_field() { # $1 = identity.json path, $2 = oauthAccount field
-  python3 - "$1" "$2" <<'PY'
+  "$PYTHON3" - "$1" "$2" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
     ident = json.load(f)
@@ -187,7 +201,7 @@ live_account_uuid() {
   local identity
   identity="$(read_live_identity 2>/dev/null || true)"
   [ -n "$identity" ] || return 0
-  printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])'
+  printf '%s' "$identity" | "$PYTHON3" -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])'
 }
 
 # Name of the saved profile holding a given accountUuid. Empty when no profile owns it.
@@ -215,7 +229,7 @@ state_init() {
 
 state_check() {
   [ -f "$STATE_FILE" ] || return 1
-  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$STATE_FILE" 2>/dev/null
+  "$PYTHON3" -c 'import json,sys; json.load(open(sys.argv[1]))' "$STATE_FILE" 2>/dev/null
 }
 
 require_state() {
@@ -226,7 +240,7 @@ require_state() {
 
 state_get() { # active | order
   [ -f "$STATE_FILE" ] || return 0
-  python3 - "$STATE_FILE" "$1" <<'PY'
+  "$PYTHON3" - "$STATE_FILE" "$1" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
     state = json.load(f)
@@ -238,7 +252,7 @@ PY
 }
 
 state_update() { # $1 = active|add|remove, $2 = name
-  SWAPPY_OP="$1" SWAPPY_NAME="$2" python3 - "$STATE_FILE" <<'PY'
+  SWAPPY_OP="$1" SWAPPY_NAME="$2" "$PYTHON3" - "$STATE_FILE" <<'PY'
 import json, os, sys
 path = sys.argv[1]
 with open(path) as f:
@@ -262,27 +276,53 @@ PY
 # ---------- switch lock ----------
 
 # One switch at a time: manual `swappy use` and the scheduled observer must never interleave
-# their credential + identity writes. mkdir is atomic; a lock older than two minutes is a
-# crashed holder and gets overridden.
+# their credential + identity writes. mkdir is atomic. The lock dir holds the owner's pid and a
+# nonce; release only removes a lock that still carries our nonce. A lock is stale when its pid is
+# dead or it is older than ten minutes (a keychain prompt can legitimately take a while), and a
+# stale lock is stolen by an atomic rename to a unique name, so two stealers cannot both win.
 SWITCH_LOCK_HELD=0
+SWITCH_LOCK_NONCE=""
 
 release_switch_lock() {
   if [ "$SWITCH_LOCK_HELD" -eq 1 ]; then
-    rmdir "$SWITCH_LOCK" 2>/dev/null || true
+    if [ "$(cat "$SWITCH_LOCK/nonce" 2>/dev/null)" = "$SWITCH_LOCK_NONCE" ]; then
+      rm -f "$SWITCH_LOCK/pid" "$SWITCH_LOCK/nonce"
+      rmdir "$SWITCH_LOCK" 2>/dev/null || true
+    fi
     SWITCH_LOCK_HELD=0
   fi
 }
 
+switch_lock_dir_stale() { # $1 = lock dir
+  local pid
+  pid="$(cat "$1/pid" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  [ -n "$(find "$1" -maxdepth 0 -mmin +10 2>/dev/null)" ]
+}
+
 acquire_switch_lock() {
+  [ "$SWITCH_LOCK_HELD" -ne 1 ] || return 0 # already held by this run (e.g. the observe tick)
   mkdir -p "$SWAPPY_DIR" 2>/dev/null || return 1
+  local nonce="$$.$RANDOM$RANDOM.$(date +%s)"
   if ! mkdir "$SWITCH_LOCK" 2>/dev/null; then
-    if [ -n "$(find "$SWITCH_LOCK" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
-      rmdir "$SWITCH_LOCK" 2>/dev/null || true
-      mkdir "$SWITCH_LOCK" 2>/dev/null || return 1
+    switch_lock_dir_stale "$SWITCH_LOCK" || return 1
+    local grave="$SWITCH_LOCK.stale.$nonce"
+    mv "$SWITCH_LOCK" "$grave" 2>/dev/null || return 1
+    if switch_lock_dir_stale "$grave"; then
+      rm -f "$grave/pid" "$grave/nonce"
+      rmdir "$grave" 2>/dev/null || true
     else
+      # we grabbed a live lock someone else had just taken: put it back and give up
+      mv "$grave" "$SWITCH_LOCK" 2>/dev/null || true
       return 1
     fi
+    mkdir "$SWITCH_LOCK" 2>/dev/null || return 1
   fi
+  printf '%s' "$$" >"$SWITCH_LOCK/pid"
+  printf '%s' "$nonce" >"$SWITCH_LOCK/nonce"
+  SWITCH_LOCK_NONCE="$nonce"
   SWITCH_LOCK_HELD=1
   trap release_switch_lock EXIT
   trap 'exit 130' INT TERM HUP
@@ -298,7 +338,7 @@ cmd_save() {
   secret="$(live_creds_read || true)"
   [ -n "$secret" ] || die "$(no_login_hint)"
   identity="$(read_live_identity)" || die "no oauthAccount in $CLAUDE_JSON — log in with 'claude' first (swappy only manages OAuth logins)"
-  live_uuid="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
+  live_uuid="$(printf '%s' "$identity" | "$PYTHON3" -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
 
   require_state
   state_init
@@ -383,7 +423,7 @@ cmd_use() {
   live_identity="$(read_live_identity || true)"
 
   if [ -n "$live_secret" ] && [ -n "$live_identity" ]; then
-    live_uuid="$(printf '%s' "$live_identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
+    live_uuid="$(printf '%s' "$live_identity" | "$PYTHON3" -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
     owner="$(profile_owning_uuid "$live_uuid")"
 
     # Drift reconciliation: Claude Code rotates OAuth tokens while an account is active.
@@ -398,7 +438,7 @@ cmd_use() {
       [ "$(state_get active)" = "$owner" ] || state_update active "$owner" || die "failed to update state file $STATE_FILE"
     elif [ "$force" -ne 1 ]; then
       local live_email
-      live_email="$(printf '%s' "$live_identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"].get("emailAddress",""))')"
+      live_email="$(printf '%s' "$live_identity" | "$PYTHON3" -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"].get("emailAddress",""))')"
       die "current account ($live_email) isn't saved — 'swappy save <name>' it first, or add --force to discard its login"
     fi
   fi
@@ -579,7 +619,12 @@ def fetch():
         with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as resp:
             body = resp.read(1 << 20)
     except urllib.error.HTTPError as e:
-        return fail("HTTP %d" % e.code)
+        out = fail("HTTP %d" % e.code)
+        out["status"] = e.code
+        ra = e.headers.get("Retry-After") if e.headers else None
+        if isinstance(ra, str) and ra.strip().isdigit():
+            out["retry_after"] = int(ra.strip())
+        return out
     except Exception as e:  # URLError, ssl.SSLError, socket.timeout, OSError, ValueError, ...
         return fail("request failed (%s)" % type(e).__name__)
     try:
@@ -634,6 +679,9 @@ def op_eval():
         # the account is back only once every over-threshold window has reset; with no reset time
         # on record fall back to an hour, which only delays re-using it
         until = max(known) if len(known) == len(over) else now() + datetime.timedelta(hours=1)
+        # a reset time already in the past (clock skew, stale window) must not make the mark expire
+        # at once and flip-flop between accounts; an absurd one must not park an account forever
+        until = min(max(until, now() + datetime.timedelta(minutes=15)), now() + datetime.timedelta(days=8))
         print("over\t%s\t%s" % (iso(until), summary))
     else:
         print("ok\t-\t" + summary)
@@ -705,6 +753,23 @@ def main():
         data = load()
         if data["exhausted"].pop(name, None) is not None:
             save(data)
+    elif op == "backoff":
+        # 429: skip ticks until Retry-After (default 30 min, capped at 6 h); anything else clears it
+        data = load()
+        res = usage_json()
+        if res.get("status") == 429:
+            secs = res.get("retry_after")
+            secs = 1800 if not isinstance(secs, int) else secs
+            secs = min(max(secs, 60), 6 * 3600)
+            data["skip_until"] = iso(now() + datetime.timedelta(seconds=secs))
+            save(data)
+            print(data["skip_until"])
+        elif data.pop("skip_until", None) is not None:
+            save(data)
+    elif op == "skipping":
+        t = parse_ts(load().get("skip_until"))
+        if t and t > now():
+            print(iso(t))
     elif op == "lastrun":
         data = load()
         data["last_run"] = {"at": iso(now()), "result": os.environ.get("SWAPPY_RESULT", "")}
@@ -720,7 +785,7 @@ def main():
 main()
 PY
 
-observe_py() { SWAPPY_OBS_FILE="$OBSERVE_FILE" python3 -c "$OBSERVE_PY" "$@"; }
+observe_py() { SWAPPY_OBS_FILE="$OBSERVE_FILE" "$PYTHON3" -c "$OBSERVE_PY" "$@"; }
 
 cmd_usage() {
   BACKEND="$(detect_backend)"
@@ -765,9 +830,28 @@ observe_notify() {
 # One check. Never fetches other profiles' usage and never calls a token refresh endpoint.
 # Every refusal path logs and returns 0: a flaky tick must not switch accounts or fail the job.
 observe_tick() { # $1 = t5, $2 = t7
-  local t5="$1" t7="$2"
   umask 077
   mkdir -p "$SWAPPY_DIR"
+  # The whole read-check-switch sequence (and every observe.json write) runs under the switch lock,
+  # so a manual `swappy use` or an overlapping tick cannot interleave with it. cmd_use sees the lock
+  # as already held by this run.
+  if ! acquire_switch_lock; then
+    observe_log "tick: another switch is in progress (switch lock held) — skipping"
+    return 0
+  fi
+  observe_tick_locked "$1" "$2"
+  release_switch_lock
+  return 0
+}
+
+observe_tick_locked() { # $1 = t5, $2 = t7
+  local t5="$1" t7="$2"
+  local skip
+  skip="$(observe_py skipping)"
+  if [ -n "$skip" ]; then
+    observe_end backoff "tick: backing off until $skip after an HTTP 429 — nothing to do"
+    return 0
+  fi
   BACKEND="$(detect_backend)"
   if [ ! -f "$STATE_FILE" ] || ! state_check; then
     observe_end no-state "tick: no usable state file — save a profile first"
@@ -793,6 +877,7 @@ observe_tick() { # $1 = t5, $2 = t7
   local result state until summary
   result="$(SWAPPY_CREDS="$secret" SWAPPY_USAGE_URL="$USAGE_URL" observe_py fetch)"
   secret=""
+  skip="$(SWAPPY_USAGE_JSON="$result" observe_py backoff || true)"
   IFS=$'\t' read -r state until summary <<EOF
 $(SWAPPY_USAGE_JSON="$result" SWAPPY_T5="$t5" SWAPPY_T7="$t7" observe_py eval)
 EOF
@@ -804,7 +889,14 @@ EOF
       return 0
       ;;
     over) ;;
-    *) observe_end error "tick: usage unavailable ($summary) — not switching"; return 0 ;;
+    *)
+      if [ -n "$skip" ]; then
+        observe_end error "tick: usage unavailable ($summary) — not switching; backing off until $skip"
+      else
+        observe_end error "tick: usage unavailable ($summary) — not switching"
+      fi
+      return 0
+      ;;
   esac
 
   observe_log "tick: $owner usage $summary — over threshold, exhausted until $until"
@@ -845,14 +937,15 @@ $p
   fi
 
   # Never --force: an automatic switch must not be able to discard a login.
-  local out rc
-  out="$( (cmd_use "$cand") 2>&1)"
+  local rc
+  (cmd_use "$cand") >/dev/null 2>&1
   rc=$?
   if [ "$rc" -eq 0 ]; then
     SWAPPY_VALUE=0 observe_py setnotified || true
-    observe_end switched "tick: switched $owner -> $cand: $(printf '%s' "$out" | head -n 1)"
+    observe_end switched "tick: switched $owner -> $cand"
   else
-    observe_end switch-failed "tick: switch to '$cand' failed, staying on '$owner': $(printf '%s' "$out" | tr '\n' ' ')"
+    # cmd_use's output carries emails and arbitrary stderr: log only that it failed
+    observe_end switch-failed "tick: switch to '$cand' failed (exit $rc), staying on '$owner'"
   fi
   return 0
 }
@@ -890,6 +983,7 @@ observe_plist_text() { # swappy_path log_path path_env t5 t7 [xdg_config_home]
     <string>$5</string>
   </array>
   <key>StartInterval</key><integer>$OBSERVE_INTERVAL_SECS</integer>
+  <key>Umask</key><integer>63</integer>
   <key>RunAtLoad</key><true/>
   <key>EnvironmentVariables</key>
   <dict>
@@ -902,7 +996,10 @@ observe_plist_text() { # swappy_path log_path path_env t5 t7 [xdg_config_home]
 EOF
 }
 
-systemd_escape_text() { # % and $ are special in unit files
+systemd_escape_text() { # % and $ are special in unit files; quotes, backslashes, newlines cannot be quoted safely
+  case "$1" in
+    *\"* | *\\* | *$'\n'*) die "refusing to write a systemd unit with a double quote, backslash or newline in '$(printf '%s' "$1" | tr '\n' ' ')'" ;;
+  esac
   local out
   out="$(printf '%s' "$1" | sed -e 's/%/%%/g' -e 's/\$/$$/g')"
   printf '%s' "$out"
@@ -910,8 +1007,8 @@ systemd_escape_text() { # % and $ are special in unit files
 
 observe_service_text() { # swappy_path path_env t5 t7
   local s p
-  s="$(systemd_escape_text "$1")"
-  p="$(systemd_escape_text "$2")"
+  s="$(systemd_escape_text "$1")" || exit 1
+  p="$(systemd_escape_text "$2")" || exit 1
   cat <<EOF
 [Unit]
 Description=swappy observe: rotate Claude accounts before the usage limit
@@ -920,6 +1017,7 @@ Description=swappy observe: rotate Claude accounts before the usage limit
 Type=oneshot
 ExecStart="$s" observe --tick --t5 $3 --t7 $4
 Environment="PATH=$p"
+UMask=0077
 EOF
 }
 
@@ -981,10 +1079,11 @@ observe_install() { # $1 = t5, $2 = t7
   platform="$(observe_platform)"
   dir="$(observe_unit_dir "$platform")"
   self="$(observe_self)"
+  umask 077
   mkdir -p "$SWAPPY_DIR" "$dir" || die "cannot create $dir"
   if [ "$platform" = darwin ]; then
     local plist="$dir/$OBSERVE_LABEL.plist" text
-    text="$(observe_plist_text "$self" "$SWAPPY_DIR/observe.err.log" "$PATH" "$1" "$2" "${XDG_CONFIG_HOME:-}")"
+    text="$(observe_plist_text "$self" "$SWAPPY_DIR/observe.err.log" "$OBSERVE_JOB_PATH" "$1" "$2" "${XDG_CONFIG_HOME:-}")"
     observe_write_file "$plist" "$text"
     if [ -z "${SWAPPY_OBSERVE_UNIT_DIR:-}" ]; then
       launchctl bootout "gui/$(id -u)/$OBSERVE_LABEL" >/dev/null 2>&1 || true
@@ -993,7 +1092,7 @@ observe_install() { # $1 = t5, $2 = t7
     printf 'installed launchd agent: %s\n\n%s\n\n' "$plist" "$text"
   else
     local svc="$dir/swappy-observe.service" tim="$dir/swappy-observe.timer" stext ttext
-    stext="$(observe_service_text "$self" "$PATH" "$1" "$2")"
+    stext="$(observe_service_text "$self" "$OBSERVE_JOB_PATH" "$1" "$2")" || exit 1
     ttext="$(observe_timer_text)"
     observe_write_file "$svc" "$stext"
     observe_write_file "$tim" "$ttext"

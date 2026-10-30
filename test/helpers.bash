@@ -9,6 +9,8 @@ setup_home() {
   export HOME="$TEST_HOME"
   unset XDG_CONFIG_HOME
   cp "$BATS_TEST_DIRNAME/fixtures/claude.json" "$HOME/.claude.json"
+  # SWAPPY_USAGE_URL is only honored when this flag is set (never in production)
+  export SWAPPY_TEST=1
 }
 
 teardown_home() {
@@ -122,3 +124,58 @@ for key in sys.argv[2].split("."):
 print(data)
 PY
 }
+
+# ---------- observe / usage endpoint stub ----------
+
+# A real local http.server standing in for the usage endpoint (SWAPPY_USAGE_URL is tests only).
+# Responses are read from $STUB_DIR/status + $STUB_DIR/body on every request, so a test can change
+# them between ticks. Every request is appended to $STUB_DIR/requests.log.
+start_usage_stub() {
+  SWAPPY_DIR_FOR_STUB="$HOME/.config/swappy/switch.lock"
+  set_resets
+  STUB_DIR="$TEST_HOME/stub"
+  mkdir -p "$STUB_DIR"
+  stub_respond 200 '{}'
+  printf '%s' "$SWAPPY_DIR_FOR_STUB" > "$STUB_DIR/lockpath"
+  : > "$STUB_DIR/headers"
+  python3 "$BATS_TEST_DIRNAME/fixtures/usage_stub.py" "$STUB_DIR" >/dev/null 2>&1 &
+  STUB_PID=$!
+  local i
+  for i in $(seq 1 100); do
+    [ -s "$STUB_DIR/port" ] && break
+    sleep 0.1
+  done
+  [ -s "$STUB_DIR/port" ] || { echo "usage stub failed to start" >&2; return 1; }
+  export SWAPPY_USAGE_URL="http://127.0.0.1:$(cat "$STUB_DIR/port")/api/oauth/usage"
+}
+
+stop_usage_stub() {
+  if [ -n "${STUB_PID:-}" ]; then
+    kill "$STUB_PID" 2>/dev/null || true
+    wait "$STUB_PID" 2>/dev/null || true
+    STUB_PID=""
+  fi
+}
+
+stub_respond() { # status body
+  printf '%s' "$1" > "$STUB_DIR/status"
+  printf '%s' "$2" > "$STUB_DIR/body"
+}
+
+# Reset times relative to now (swappy clamps exhausted_until to now+15min .. now+8d, so fixed
+# far-future dates would no longer round-trip). R5 = now+3h, R7 = now+3d, plain ISO seconds.
+set_resets() {
+  R5="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc)+d.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+  R7="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc)+d.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+}
+
+# Body in the endpoint's shape: five_hour / seven_day utilization (0-100) + ISO resets_at.
+usage_body() { # pct5 pct7
+  printf '{"five_hour":{"utilization":%s,"resets_at":"%s.123456+00:00"},"seven_day":{"utilization":%s,"resets_at":"%s"}}' "$1" "${R5%Z}" "$2" "$R7"
+}
+
+# Extra response headers for the stub, one "Name: value" per line.
+stub_headers() { printf '%s\n' "$@" > "$STUB_DIR/headers"; }
+
+live_uuid() { json_get "$HOME/.claude.json" oauthAccount.accountUuid; }
+show_observe_log() { cat "$HOME/.config/swappy/observe.log" 2>/dev/null || true; }

@@ -13,6 +13,32 @@ KEYCHAIN_SERVICE="Claude Code-credentials"
 KEYCHAIN_ACCOUNT="${USER:-$(id -un)}"
 # SWAPPY_KEYCHAIN (tests only): extra keychain path appended to every `security` call
 # SWAPPY_BACKEND (tests only): force "keychain" or "file" instead of auto-detection
+# SWAPPY_TEST (tests only): must be set for SWAPPY_USAGE_URL to be honored at all
+# SWAPPY_USAGE_URL (tests only, needs SWAPPY_TEST): http(s) usage endpoint to query instead of
+#   Anthropic's. Ignored without SWAPPY_TEST; any other scheme is rejected. The live bearer token is
+#   sent there, so never point it at anything you do not control.
+# SWAPPY_OBSERVE_UNIT_DIR (tests only): write the launchd plist / systemd units here and skip
+#   launchctl/systemctl entirely
+# SWAPPY_NO_NOTIFY (tests only): never raise a desktop notification
+# SWAPPY_OBSERVE_INTERVAL / SWAPPY_OBSERVE_MAX_TICKS (tests only): pace and bound `observe --debug`
+OBSERVE_FILE="$SWAPPY_DIR/observe.json"
+OBSERVE_LOG="$SWAPPY_DIR/observe.log"
+SWITCH_LOCK="$SWAPPY_DIR/switch.lock"
+USAGE_URL="https://api.anthropic.com/api/oauth/usage"
+if [ -n "${SWAPPY_TEST:-}" ] && [ -n "${SWAPPY_USAGE_URL:-}" ]; then
+  case "$SWAPPY_USAGE_URL" in
+    http://* | https://*) USAGE_URL="$SWAPPY_USAGE_URL" ;;
+    *) printf 'swappy: SWAPPY_USAGE_URL must be an http(s) URL\n' >&2; exit 1 ;;
+  esac
+fi
+# Prefer the absolute system tools: a scheduled job must not resolve them through a PATH it did not choose.
+SECURITY_BIN=security
+[ ! -x /usr/bin/security ] || SECURITY_BIN=/usr/bin/security
+PYTHON3=python3
+[ ! -x /usr/bin/python3 ] || PYTHON3=/usr/bin/python3
+OBSERVE_JOB_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+OBSERVE_LABEL="com.swappy.observe"
+OBSERVE_INTERVAL_SECS=900
 
 die() { printf 'swappy: %s\n' "$*" >&2; exit 1; }
 
@@ -25,13 +51,18 @@ usage: swappy <command> [args]
   next          rotate to the next profile in order (wraps around)
   ls            list profiles, marking the active one
   rm <name>     delete a saved profile
+  usage         show the live account's 5h / 7d usage (unofficial endpoint)
+  observe       install a scheduled job that rotates accounts near the limit
+                  [--t5 N] [--t7 N]  thresholds in percent (default 85 each)
+                  --debug            run the check in the foreground with live logs
+                  --off              remove the scheduled job
   help          show this message
 EOF
 }
 
 # ---------- profile names ----------
 
-RESERVED_NAMES="save use next ls rm help"
+RESERVED_NAMES="save use next ls rm help usage observe"
 
 validate_name() {
   local name="${1:-}"
@@ -57,7 +88,7 @@ detect_backend() {
   case "$(uname)" in
     Darwin)
       if [ -f "$CREDS_FILE" ] && \
-         ! security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1; then
+         ! "$SECURITY_BIN" find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1; then
         printf 'file'
       else
         printf 'keychain'
@@ -76,7 +107,7 @@ no_login_hint() {
 live_creds_read() {
   case "$BACKEND" in
     keychain)
-      security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} 2>/dev/null
+      "$SECURITY_BIN" find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} 2>/dev/null
       ;;
     file)
       [ -f "$CREDS_FILE" ] || return 1
@@ -89,7 +120,7 @@ live_creds_read() {
 live_creds_delete() {
   case "$BACKEND" in
     keychain)
-      security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1
+      "$SECURITY_BIN" delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"} >/dev/null 2>&1
       ;;
     file)
       rm -f "$CREDS_FILE"
@@ -102,7 +133,7 @@ live_creds_write() {
   local secret="$1" tmp
   case "$BACKEND" in
     keychain)
-      security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$secret" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
+      "$SECURITY_BIN" add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$secret" ${SWAPPY_KEYCHAIN:+"$SWAPPY_KEYCHAIN"}
       ;;
     file)
       tmp="$(mktemp "$(dirname "$CREDS_FILE")/.credentials.XXXXXX")" || return 1
@@ -117,7 +148,7 @@ live_creds_write() {
 # Print the live identity {userID, oauthAccount, savedAt} from ~/.claude.json.
 read_live_identity() {
   [ -f "$CLAUDE_JSON" ] || return 1
-  python3 - "$CLAUDE_JSON" <<'PY'
+  "$PYTHON3" - "$CLAUDE_JSON" <<'PY'
 import datetime, json, sys
 with open(sys.argv[1]) as f:
     data = json.load(f)
@@ -134,7 +165,7 @@ PY
 
 # Replace ONLY oauthAccount + userID in ~/.claude.json, atomically, preserving everything else.
 identity_swap() { # $1 = path to identity.json
-  SWAPPY_IDENTITY_FILE="$1" SWAPPY_CLAUDE_JSON="$CLAUDE_JSON" python3 <<'PY'
+  SWAPPY_IDENTITY_FILE="$1" SWAPPY_CLAUDE_JSON="$CLAUDE_JSON" "$PYTHON3" <<'PY'
 import json, os, tempfile
 with open(os.environ["SWAPPY_IDENTITY_FILE"]) as f:
     ident = json.load(f)
@@ -157,7 +188,7 @@ PY
 }
 
 identity_field() { # $1 = identity.json path, $2 = oauthAccount field
-  python3 - "$1" "$2" <<'PY'
+  "$PYTHON3" - "$1" "$2" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
     ident = json.load(f)
@@ -170,7 +201,7 @@ live_account_uuid() {
   local identity
   identity="$(read_live_identity 2>/dev/null || true)"
   [ -n "$identity" ] || return 0
-  printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])'
+  printf '%s' "$identity" | "$PYTHON3" -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])'
 }
 
 # Name of the saved profile holding a given accountUuid. Empty when no profile owns it.
@@ -198,7 +229,7 @@ state_init() {
 
 state_check() {
   [ -f "$STATE_FILE" ] || return 1
-  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$STATE_FILE" 2>/dev/null
+  "$PYTHON3" -c 'import json,sys; json.load(open(sys.argv[1]))' "$STATE_FILE" 2>/dev/null
 }
 
 require_state() {
@@ -209,7 +240,7 @@ require_state() {
 
 state_get() { # active | order
   [ -f "$STATE_FILE" ] || return 0
-  python3 - "$STATE_FILE" "$1" <<'PY'
+  "$PYTHON3" - "$STATE_FILE" "$1" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
     state = json.load(f)
@@ -221,7 +252,7 @@ PY
 }
 
 state_update() { # $1 = active|add|remove, $2 = name
-  SWAPPY_OP="$1" SWAPPY_NAME="$2" python3 - "$STATE_FILE" <<'PY'
+  SWAPPY_OP="$1" SWAPPY_NAME="$2" "$PYTHON3" - "$STATE_FILE" <<'PY'
 import json, os, sys
 path = sys.argv[1]
 with open(path) as f:
@@ -242,6 +273,61 @@ with open(path, "w") as f:
 PY
 }
 
+# ---------- switch lock ----------
+
+# One switch at a time: manual `swappy use` and the scheduled observer must never interleave
+# their credential + identity writes. mkdir is atomic. The lock dir holds the owner's pid and a
+# nonce; release only removes a lock that still carries our nonce. A lock is stale when its pid is
+# dead or it is older than ten minutes (a keychain prompt can legitimately take a while), and a
+# stale lock is stolen by an atomic rename to a unique name, so two stealers cannot both win.
+SWITCH_LOCK_HELD=0
+SWITCH_LOCK_NONCE=""
+
+release_switch_lock() {
+  if [ "$SWITCH_LOCK_HELD" -eq 1 ]; then
+    if [ "$(cat "$SWITCH_LOCK/nonce" 2>/dev/null)" = "$SWITCH_LOCK_NONCE" ]; then
+      rm -f "$SWITCH_LOCK/pid" "$SWITCH_LOCK/nonce"
+      rmdir "$SWITCH_LOCK" 2>/dev/null || true
+    fi
+    SWITCH_LOCK_HELD=0
+  fi
+}
+
+switch_lock_dir_stale() { # $1 = lock dir
+  local pid
+  pid="$(cat "$1/pid" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  [ -n "$(find "$1" -maxdepth 0 -mmin +10 2>/dev/null)" ]
+}
+
+acquire_switch_lock() {
+  [ "$SWITCH_LOCK_HELD" -ne 1 ] || return 0 # already held by this run (e.g. the observe tick)
+  mkdir -p "$SWAPPY_DIR" 2>/dev/null || return 1
+  local nonce="$$.$RANDOM$RANDOM.$(date +%s)"
+  if ! mkdir "$SWITCH_LOCK" 2>/dev/null; then
+    switch_lock_dir_stale "$SWITCH_LOCK" || return 1
+    local grave="$SWITCH_LOCK.stale.$nonce"
+    mv "$SWITCH_LOCK" "$grave" 2>/dev/null || return 1
+    if switch_lock_dir_stale "$grave"; then
+      rm -f "$grave/pid" "$grave/nonce"
+      rmdir "$grave" 2>/dev/null || true
+    else
+      # we grabbed a live lock someone else had just taken: put it back and give up
+      mv "$grave" "$SWITCH_LOCK" 2>/dev/null || true
+      return 1
+    fi
+    mkdir "$SWITCH_LOCK" 2>/dev/null || return 1
+  fi
+  printf '%s' "$$" >"$SWITCH_LOCK/pid"
+  printf '%s' "$nonce" >"$SWITCH_LOCK/nonce"
+  SWITCH_LOCK_NONCE="$nonce"
+  SWITCH_LOCK_HELD=1
+  trap release_switch_lock EXIT
+  trap 'exit 130' INT TERM HUP
+}
+
 # ---------- commands ----------
 
 cmd_save() {
@@ -252,7 +338,7 @@ cmd_save() {
   secret="$(live_creds_read || true)"
   [ -n "$secret" ] || die "$(no_login_hint)"
   identity="$(read_live_identity)" || die "no oauthAccount in $CLAUDE_JSON — log in with 'claude' first (swappy only manages OAuth logins)"
-  live_uuid="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
+  live_uuid="$(printf '%s' "$identity" | "$PYTHON3" -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
 
   require_state
   state_init
@@ -327,6 +413,7 @@ cmd_use() {
   validate_name "$name"
   require_state
   require_profile "$name"
+  acquire_switch_lock || die "another switch is in progress (lock: $SWITCH_LOCK) — try again in a moment"
   BACKEND="$(detect_backend)"
 
   # A missing live login is not an error here — restoring a saved profile is precisely how you
@@ -336,7 +423,7 @@ cmd_use() {
   live_identity="$(read_live_identity || true)"
 
   if [ -n "$live_secret" ] && [ -n "$live_identity" ]; then
-    live_uuid="$(printf '%s' "$live_identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
+    live_uuid="$(printf '%s' "$live_identity" | "$PYTHON3" -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"]["accountUuid"])')"
     owner="$(profile_owning_uuid "$live_uuid")"
 
     # Drift reconciliation: Claude Code rotates OAuth tokens while an account is active.
@@ -351,7 +438,7 @@ cmd_use() {
       [ "$(state_get active)" = "$owner" ] || state_update active "$owner" || die "failed to update state file $STATE_FILE"
     elif [ "$force" -ne 1 ]; then
       local live_email
-      live_email="$(printf '%s' "$live_identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"].get("emailAddress",""))')"
+      live_email="$(printf '%s' "$live_identity" | "$PYTHON3" -c 'import json,sys; print(json.load(sys.stdin)["oauthAccount"].get("emailAddress",""))')"
       die "current account ($live_email) isn't saved — 'swappy save <name>' it first, or add --force to discard its login"
     fi
   fi
@@ -438,6 +525,642 @@ cmd_rm() {
   printf "removed '%s'\n" "$name"
 }
 
+# ---------- usage + observe ----------
+
+# One python helper for everything observe does with JSON and HTTP. Operations are picked by argv;
+# data (including the bearer credential) arrives via env vars, never argv or interpolation.
+read -r -d '' OBSERVE_PY <<'PY' || true
+import datetime, json, math, os, re, socket, ssl, sys, tempfile
+import urllib.error, urllib.request
+
+UTC = datetime.timezone.utc
+OBS = os.environ.get("SWAPPY_OBS_FILE", "")
+
+
+def now():
+    return datetime.datetime.now(UTC)
+
+
+def iso(dt):
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(s):
+    if not isinstance(s, str):
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    m = re.match(r"^(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d)(\.\d+)?(.*)$", s)
+    if not m:
+        return None
+    frac = ("." + m.group(2)[1:].ljust(6, "0")[:6]) if m.group(2) else ""
+    try:
+        dt = datetime.datetime.fromisoformat(m.group(1) + frac + m.group(3))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+# ---- observe.json (separate from state.json; tolerant of corruption; atomic writes) ----
+
+def load():
+    try:
+        with open(OBS) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("version", 1)
+    if not isinstance(data.get("exhausted"), dict):
+        data["exhausted"] = {}
+    return data
+
+
+def save(data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(OBS)), prefix=".observe.json.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, OBS)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+# ---- usage endpoint ----
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def fail(reason):
+    return {"ok": False, "reason": reason}
+
+
+def fetch():
+    try:
+        token = json.loads(os.environ.get("SWAPPY_CREDS", ""))["claudeAiOauth"]["accessToken"]
+        if not isinstance(token, str) or not token:
+            raise ValueError
+    except Exception:
+        return fail("no access token in the live credential")
+    req = urllib.request.Request(os.environ["SWAPPY_USAGE_URL"], headers={
+        "Authorization": "Bearer " + token,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Accept": "application/json",
+        "User-Agent": "swappy",
+    })
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as resp:
+            body = resp.read(1 << 20)
+    except urllib.error.HTTPError as e:
+        out = fail("HTTP %d" % e.code)
+        out["status"] = e.code
+        ra = e.headers.get("Retry-After") if e.headers else None
+        if isinstance(ra, str) and ra.strip().isdigit():
+            out["retry_after"] = int(ra.strip())
+        return out
+    except Exception as e:  # URLError, ssl.SSLError, socket.timeout, OSError, ValueError, ...
+        return fail("request failed (%s)" % type(e).__name__)
+    try:
+        data = json.loads(body.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError
+        out = {"ok": True}
+        for key in ("five_hour", "seven_day"):
+            w = data.get(key)
+            if w is None:
+                out[key] = None
+                continue
+            u = w["utilization"]
+            if isinstance(u, bool) or not isinstance(u, (int, float)) or not math.isfinite(u) or u < 0:
+                raise ValueError
+            r = w.get("resets_at")
+            out[key] = {"utilization": u, "resets_at": r if isinstance(r, str) else None}
+        if out["five_hour"] is None and out["seven_day"] is None:
+            return fail("no usage data in the response")
+        return out
+    except Exception:
+        return fail("unparseable response")
+
+
+def usage_json():
+    try:
+        data = json.loads(os.environ.get("SWAPPY_USAGE_JSON", ""))
+        return data if isinstance(data, dict) else fail("unparseable result")
+    except ValueError:
+        return fail("unparseable result")
+
+
+def op_eval():
+    data = usage_json()
+    if not data.get("ok"):
+        print("error\t-\t" + str(data.get("reason", "unknown error")))
+        return
+    thresholds = (("five_hour", "5h", float(os.environ["SWAPPY_T5"])),
+                  ("seven_day", "7d", float(os.environ["SWAPPY_T7"])))
+    over, parts = [], []
+    for key, label, limit in thresholds:
+        w = data.get(key)
+        if not w:
+            parts.append(label + " n/a")
+            continue
+        parts.append("%s %g%%" % (label, w["utilization"]))
+        if w["utilization"] >= limit:
+            over.append(parse_ts(w.get("resets_at")))
+    summary = ", ".join(parts)
+    if over:
+        known = [t for t in over if t]
+        # the account is back only once every over-threshold window has reset; with no reset time
+        # on record fall back to an hour, which only delays re-using it
+        until = max(known) if len(known) == len(over) else now() + datetime.timedelta(hours=1)
+        # a reset time already in the past (clock skew, stale window) must not make the mark expire
+        # at once and flip-flop between accounts; an absurd one must not park an account forever
+        until = min(max(until, now() + datetime.timedelta(minutes=15)), now() + datetime.timedelta(days=8))
+        print("over\t%s\t%s" % (iso(until), summary))
+    else:
+        print("ok\t-\t" + summary)
+
+
+def op_render():
+    data = usage_json()
+    if not data.get("ok"):
+        print("swappy: usage unavailable: %s" % data.get("reason", "unknown error"), file=sys.stderr)
+        sys.exit(1)
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        w = data.get(key)
+        if not w:
+            print("%s  n/a" % label)
+        else:
+            reset = parse_ts(w.get("resets_at"))
+            print("%s  %g%%  resets %s" % (label, w["utilization"], iso(reset) if reset else "unknown"))
+
+
+def op_identity():
+    # Same-account check that needs no token refresh: the live token must not be one we saved for a
+    # DIFFERENT profile. (A drifted/rotated token matches nothing and passes: see README.)
+    owner = os.environ["SWAPPY_OWNER"]
+    try:
+        creds = json.loads(os.environ["SWAPPY_CREDS"])["claudeAiOauth"]
+    except Exception:
+        print("bad")
+        return
+    live = {creds.get(k) for k in ("accessToken", "refreshToken")} - {None, ""}
+    if not creds.get("accessToken"):
+        print("bad")
+        return
+    for name in os.environ.get("SWAPPY_ORDER", "").split():
+        if name == owner:
+            continue
+        try:
+            with open(os.path.join(os.environ["SWAPPY_PROFILES_DIR"], name, "credentials.json")) as f:
+                other = json.load(f)["claudeAiOauth"]
+        except Exception:
+            continue
+        saved = {other.get(k) for k in ("accessToken", "refreshToken")} - {None, ""}
+        if live & saved:
+            print("mismatch " + name)
+            return
+    print("ok")
+
+
+def main():
+    op = sys.argv[1]
+    name = os.environ.get("SWAPPY_NAME", "")
+    if op == "fetch":
+        print(json.dumps(fetch()))
+    elif op == "eval":
+        op_eval()
+    elif op == "render":
+        op_render()
+    elif op == "identity":
+        op_identity()
+    elif op == "exhausted":
+        for n, until in sorted(load()["exhausted"].items()):
+            t = parse_ts(until)
+            if t and t > now():
+                print(n)
+    elif op == "mark":
+        data = load()
+        data["exhausted"][name] = os.environ["SWAPPY_UNTIL"]
+        save(data)
+    elif op == "clear":
+        data = load()
+        if data["exhausted"].pop(name, None) is not None:
+            save(data)
+    elif op == "backoff":
+        # 429: skip ticks until Retry-After (default 30 min, capped at 6 h); anything else clears it
+        data = load()
+        res = usage_json()
+        if res.get("status") == 429:
+            secs = res.get("retry_after")
+            secs = 1800 if not isinstance(secs, int) else secs
+            secs = min(max(secs, 60), 6 * 3600)
+            data["skip_until"] = iso(now() + datetime.timedelta(seconds=secs))
+            save(data)
+            print(data["skip_until"])
+        elif data.pop("skip_until", None) is not None:
+            save(data)
+    elif op == "skipping":
+        t = parse_ts(load().get("skip_until"))
+        if t and t > now():
+            print(iso(t))
+    elif op == "lastrun":
+        data = load()
+        data["last_run"] = {"at": iso(now()), "result": os.environ.get("SWAPPY_RESULT", "")}
+        save(data)
+    elif op == "notified":
+        print(1 if load().get("notified") else 0)
+    elif op == "setnotified":
+        data = load()
+        data["notified"] = os.environ.get("SWAPPY_VALUE") == "1"
+        save(data)
+
+
+main()
+PY
+
+observe_py() { SWAPPY_OBS_FILE="$OBSERVE_FILE" "$PYTHON3" -c "$OBSERVE_PY" "$@"; }
+
+cmd_usage() {
+  BACKEND="$(detect_backend)"
+  local secret result
+  secret="$(live_creds_read || true)"
+  [ -n "$secret" ] || die "$(no_login_hint)"
+  result="$(SWAPPY_CREDS="$secret" SWAPPY_USAGE_URL="$USAGE_URL" observe_py fetch)"
+  SWAPPY_USAGE_JSON="$result" observe_py render || exit 1
+}
+
+# ---------- observe: the check ----------
+
+observe_log() {
+  local line
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
+  printf '%s\n' "$line" >>"$OBSERVE_LOG"
+  [ -z "${OBSERVE_ECHO:-}" ] || printf '%s\n' "$line"
+  # keep the log bounded (~1 MB)
+  if [ "$(wc -c <"$OBSERVE_LOG" | tr -d ' ')" -gt 1048576 ]; then
+    tail -n 2000 "$OBSERVE_LOG" >"$OBSERVE_LOG.tmp" && mv "$OBSERVE_LOG.tmp" "$OBSERVE_LOG"
+  fi
+  return 0
+}
+
+observe_end() { # $1 = result code, $2.. = log message; always succeeds (a tick never fails the job)
+  local result="$1"
+  shift
+  observe_log "$*"
+  SWAPPY_RESULT="$result" observe_py lastrun || true
+  return 0
+}
+
+observe_notify() {
+  [ -z "${SWAPPY_NO_NOTIFY:-}" ] || return 0
+  case "$(uname)" in
+    Darwin) SWAPPY_MSG="$1" osascript -e 'display notification (system attribute "SWAPPY_MSG") with title "swappy"' >/dev/null 2>&1 || true ;;
+    *) command -v notify-send >/dev/null 2>&1 && notify-send swappy "$1" >/dev/null 2>&1 || true ;;
+  esac
+  return 0
+}
+
+# One check. Never fetches other profiles' usage and never calls a token refresh endpoint.
+# Every refusal path logs and returns 0: a flaky tick must not switch accounts or fail the job.
+observe_tick() { # $1 = t5, $2 = t7
+  umask 077
+  mkdir -p "$SWAPPY_DIR"
+  # The whole read-check-switch sequence (and every observe.json write) runs under the switch lock,
+  # so a manual `swappy use` or an overlapping tick cannot interleave with it. cmd_use sees the lock
+  # as already held by this run.
+  if ! acquire_switch_lock; then
+    observe_log "tick: another switch is in progress (switch lock held) — skipping"
+    return 0
+  fi
+  observe_tick_locked "$1" "$2"
+  release_switch_lock
+  return 0
+}
+
+observe_tick_locked() { # $1 = t5, $2 = t7
+  local t5="$1" t7="$2"
+  local skip
+  skip="$(observe_py skipping)"
+  if [ -n "$skip" ]; then
+    observe_end backoff "tick: backing off until $skip after an HTTP 429 — nothing to do"
+    return 0
+  fi
+  BACKEND="$(detect_backend)"
+  if [ ! -f "$STATE_FILE" ] || ! state_check; then
+    observe_end no-state "tick: no usable state file — save a profile first"
+    return 0
+  fi
+  local secret uuid owner
+  secret="$(live_creds_read || true)"
+  [ -n "$secret" ] || { observe_end no-login "tick: no live login found — nothing to do"; return 0; }
+  uuid="$(live_account_uuid)"
+  [ -n "$uuid" ] || { observe_end no-identity "tick: no identity in $CLAUDE_JSON — nothing to do"; return 0; }
+  owner="$(profile_owning_uuid "$uuid")"
+  [ -n "$owner" ] || { observe_end unsaved "tick: live account is not saved as a profile — not switching (run 'swappy save <name>')"; return 0; }
+
+  local order check
+  order="$(state_get order)"
+  check="$(SWAPPY_CREDS="$secret" SWAPPY_OWNER="$owner" SWAPPY_ORDER="$order" SWAPPY_PROFILES_DIR="$PROFILES_DIR" observe_py identity)"
+  case "$check" in
+    ok) ;;
+    mismatch*) observe_end identity-mismatch "tick: identity check failed — live token matches saved profile '${check#mismatch }' but $CLAUDE_JSON names '$owner'; not switching"; return 0 ;;
+    *) observe_end identity-mismatch "tick: identity check failed — no usable access token in the live credential; not switching"; return 0 ;;
+  esac
+
+  local result state until summary
+  result="$(SWAPPY_CREDS="$secret" SWAPPY_USAGE_URL="$USAGE_URL" observe_py fetch)"
+  secret=""
+  skip="$(SWAPPY_USAGE_JSON="$result" observe_py backoff || true)"
+  IFS=$'\t' read -r state until summary <<EOF
+$(SWAPPY_USAGE_JSON="$result" SWAPPY_T5="$t5" SWAPPY_T7="$t7" observe_py eval)
+EOF
+  case "$state" in
+    ok)
+      SWAPPY_NAME="$owner" observe_py clear || true
+      SWAPPY_VALUE=0 observe_py setnotified || true
+      observe_end ok "tick: $owner usage $summary (switch at 5h>=$t5%, 7d>=$t7%) — no switch"
+      return 0
+      ;;
+    over) ;;
+    *)
+      if [ -n "$skip" ]; then
+        observe_end error "tick: usage unavailable ($summary) — not switching; backing off until $skip"
+      else
+        observe_end error "tick: usage unavailable ($summary) — not switching"
+      fi
+      return 0
+      ;;
+  esac
+
+  observe_log "tick: $owner usage $summary — over threshold, exhausted until $until"
+  SWAPPY_NAME="$owner" SWAPPY_UNTIL="$until" observe_py mark || true
+
+  local exhausted p seen=0 before="" after="" cand=""
+  exhausted="$(observe_py exhausted)"
+  for p in $order; do
+    if [ "$p" = "$owner" ]; then
+      seen=1
+    elif [ "$seen" -eq 1 ]; then
+      after="$after $p"
+    else
+      before="$before $p"
+    fi
+  done
+  for p in $after $before; do
+    case "
+$exhausted
+" in
+      *"
+$p
+"*) continue ;;
+    esac
+    cand="$p"
+    break
+  done
+
+  if [ -z "$cand" ]; then
+    if [ "$(observe_py notified)" = "1" ]; then
+      observe_end all-exhausted "tick: every profile is exhausted — staying on '$owner' (already notified)"
+    else
+      SWAPPY_VALUE=1 observe_py setnotified || true
+      observe_notify "All saved Claude accounts are at their usage limit."
+      observe_end all-exhausted "tick: every profile is exhausted — staying on '$owner' (notified)"
+    fi
+    return 0
+  fi
+
+  # Never --force: an automatic switch must not be able to discard a login.
+  local rc
+  (cmd_use "$cand") >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    SWAPPY_VALUE=0 observe_py setnotified || true
+    observe_end switched "tick: switched $owner -> $cand"
+  else
+    # cmd_use's output carries emails and arbitrary stderr: log only that it failed
+    observe_end switch-failed "tick: switch to '$cand' failed (exit $rc), staying on '$owner'"
+  fi
+  return 0
+}
+
+# ---------- observe: scheduler job text (pure) ----------
+
+xml_escape() {
+  local out
+  out="$(printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+  printf '%s' "$out"
+}
+
+# launchd agent. All paths absolute: launchd gives jobs a minimal environment.
+observe_plist_text() { # swappy_path log_path path_env t5 t7 [xdg_config_home]
+  local s l p xdg=""
+  s="$(xml_escape "$1")"
+  l="$(xml_escape "$2")"
+  p="$(xml_escape "$3")"
+  [ -z "${6:-}" ] || xdg="
+    <key>XDG_CONFIG_HOME</key><string>$(xml_escape "$6")</string>"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$OBSERVE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$s</string>
+    <string>observe</string>
+    <string>--tick</string>
+    <string>--t5</string>
+    <string>$4</string>
+    <string>--t7</string>
+    <string>$5</string>
+  </array>
+  <key>StartInterval</key><integer>$OBSERVE_INTERVAL_SECS</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$p</string>$xdg
+  </dict>
+  <key>StandardOutPath</key><string>$l</string>
+  <key>StandardErrorPath</key><string>$l</string>
+</dict>
+</plist>
+EOF
+}
+
+systemd_escape_text() { # % and $ are special in unit files; quotes, backslashes, newlines cannot be quoted safely
+  case "$1" in
+    *\"* | *\\* | *$'\n'*) die "refusing to write a systemd unit with a double quote, backslash or newline in '$(printf '%s' "$1" | tr '\n' ' ')'" ;;
+  esac
+  local out
+  out="$(printf '%s' "$1" | sed -e 's/%/%%/g' -e 's/\$/$$/g')"
+  printf '%s' "$out"
+}
+
+observe_service_text() { # swappy_path path_env t5 t7
+  local s p
+  s="$(systemd_escape_text "$1")" || exit 1
+  p="$(systemd_escape_text "$2")" || exit 1
+  cat <<EOF
+[Unit]
+Description=swappy observe: rotate Claude accounts before the usage limit
+
+[Service]
+Type=oneshot
+ExecStart="$s" observe --tick --t5 $3 --t7 $4
+Environment="PATH=$p"
+UMask=0077
+EOF
+}
+
+observe_timer_text() {
+  cat <<EOF
+[Unit]
+Description=Run swappy observe every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# ---------- observe: install / off / debug ----------
+
+# Absolute, symlink-resolved path of this script (the job must not depend on PATH).
+observe_self() {
+  local p="$0" l
+  while [ -L "$p" ]; do
+    l="$(readlink "$p")"
+    case "$l" in
+      /*) p="$l" ;;
+      *) p="$(dirname "$p")/$l" ;;
+    esac
+  done
+  printf '%s/%s' "$(cd "$(dirname "$p")" && pwd -P)" "$(basename "$p")"
+}
+
+observe_write_file() { # path, text
+  local tmp
+  tmp="$(mktemp "$(dirname "$1")/.swappy-job.XXXXXX")" || die "cannot write $1"
+  printf '%s\n' "$2" >"$tmp" && chmod 644 "$tmp" && mv "$tmp" "$1" || die "cannot write $1"
+}
+
+observe_unit_dir() { # $1 = darwin|linux
+  if [ -n "${SWAPPY_OBSERVE_UNIT_DIR:-}" ]; then
+    printf '%s' "$SWAPPY_OBSERVE_UNIT_DIR"
+  elif [ "$1" = darwin ]; then
+    printf '%s' "$HOME/Library/LaunchAgents"
+  else
+    printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  fi
+}
+
+observe_platform() {
+  case "$(uname)" in
+    Darwin) printf darwin ;;
+    Linux) printf linux ;;
+    *) die "swappy observe supports macOS and Linux only" ;;
+  esac
+}
+
+observe_install() { # $1 = t5, $2 = t7
+  local platform dir self
+  platform="$(observe_platform)"
+  dir="$(observe_unit_dir "$platform")"
+  self="$(observe_self)"
+  umask 077
+  mkdir -p "$SWAPPY_DIR" "$dir" || die "cannot create $dir"
+  if [ "$platform" = darwin ]; then
+    local plist="$dir/$OBSERVE_LABEL.plist" text
+    text="$(observe_plist_text "$self" "$SWAPPY_DIR/observe.err.log" "$OBSERVE_JOB_PATH" "$1" "$2" "${XDG_CONFIG_HOME:-}")"
+    observe_write_file "$plist" "$text"
+    if [ -z "${SWAPPY_OBSERVE_UNIT_DIR:-}" ]; then
+      launchctl bootout "gui/$(id -u)/$OBSERVE_LABEL" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/$(id -u)" "$plist" || die "launchctl could not load $plist"
+    fi
+    printf 'installed launchd agent: %s\n\n%s\n\n' "$plist" "$text"
+  else
+    local svc="$dir/swappy-observe.service" tim="$dir/swappy-observe.timer" stext ttext
+    stext="$(observe_service_text "$self" "$OBSERVE_JOB_PATH" "$1" "$2")" || exit 1
+    ttext="$(observe_timer_text)"
+    observe_write_file "$svc" "$stext"
+    observe_write_file "$tim" "$ttext"
+    if [ -z "${SWAPPY_OBSERVE_UNIT_DIR:-}" ]; then
+      systemctl --user daemon-reload && systemctl --user enable --now swappy-observe.timer && systemctl --user restart swappy-observe.timer \
+        || die "systemctl --user could not enable swappy-observe.timer"
+    fi
+    printf 'installed systemd user timer:\n  %s\n  %s\n\n%s\n\n%s\n\n' "$svc" "$tim" "$stext" "$ttext"
+  fi
+  printf 'checks every 15 minutes; switches when 5h usage >= %s%% or 7d usage >= %s%%\n' "$1" "$2"
+  printf 'log: %s\nstop it with: swappy observe --off\n' "$OBSERVE_LOG"
+}
+
+observe_off() {
+  local platform dir
+  platform="$(observe_platform)"
+  dir="$(observe_unit_dir "$platform")"
+  [ -n "$dir" ] || die "cannot work out where the job lives"
+  if [ "$platform" = darwin ]; then
+    [ -n "${SWAPPY_OBSERVE_UNIT_DIR:-}" ] || launchctl bootout "gui/$(id -u)/$OBSERVE_LABEL" >/dev/null 2>&1 || true
+    rm -f "${dir:?}/${OBSERVE_LABEL:?}.plist"
+  else
+    [ -n "${SWAPPY_OBSERVE_UNIT_DIR:-}" ] || systemctl --user disable --now swappy-observe.timer >/dev/null 2>&1 || true
+    rm -f "${dir:?}/swappy-observe.service" "${dir:?}/swappy-observe.timer"
+    [ -n "${SWAPPY_OBSERVE_UNIT_DIR:-}" ] || systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+  printf 'observe job removed\n'
+}
+
+observe_threshold() { # flag, value
+  [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -ge 1 ] && [ "$2" -le 100 ] || die "$1 needs a whole number from 1 to 100 (got '${2:-}')"
+}
+
+cmd_observe() {
+  local mode=install t5=85 t7=85
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tick) mode=tick ;;
+      --debug) mode=debug ;;
+      --off) mode=off ;;
+      --t5 | --t7)
+        [ $# -ge 2 ] || die "$1 needs a value"
+        observe_threshold "$1" "$2"
+        if [ "$1" = "--t5" ]; then t5="$2"; else t7="$2"; fi
+        shift
+        ;;
+      *) die "unknown observe option '$1' (try: swappy help)" ;;
+    esac
+    shift
+  done
+  case "$mode" in
+    install) observe_install "$t5" "$t7" ;;
+    off) observe_off ;;
+    tick) observe_tick "$t5" "$t7" ;;
+    debug)
+      OBSERVE_ECHO=1
+      local n=0 interval="${SWAPPY_OBSERVE_INTERVAL:-$OBSERVE_INTERVAL_SECS}" max="${SWAPPY_OBSERVE_MAX_TICKS:-0}"
+      printf 'observing every %ss (Ctrl-C to stop); log: %s\n' "$interval" "$OBSERVE_LOG"
+      while :; do
+        (observe_tick "$t5" "$t7") || true
+        n=$((n + 1))
+        if [ "$max" -gt 0 ] && [ "$n" -ge "$max" ]; then break; fi
+        sleep "$interval"
+      done
+      ;;
+  esac
+}
+
 # ---------- dispatch ----------
 
 main() {
@@ -450,6 +1173,8 @@ main() {
     next) cmd_next "$@" ;;
     ls | list | status) cmd_ls "$@" ;;
     rm) cmd_rm "$@" ;;
+    usage) cmd_usage "$@" ;;
+    observe) cmd_observe "$@" ;;
     help | -h | --help) usage ;;
     -*) usage >&2; die "unknown command '$cmd'" ;;
     *)
@@ -463,4 +1188,7 @@ main() {
   esac
 }
 
-main "$@"
+# Only run when executed, so tests can source this file for the pure functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

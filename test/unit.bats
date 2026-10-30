@@ -70,7 +70,7 @@ teardown() {
 
 @test "reserved command words cannot be used as profile names" {
   setup_file_backend '{"claudeAiOauth":{"accessToken":"tok"}}'
-  for reserved in save use next ls rm help; do
+  for reserved in save use next ls rm help usage observe; do
     run "$SWAPPY" save "$reserved"
     [ "$status" -eq 1 ]
     [[ "$output" == *"reserved"* ]]

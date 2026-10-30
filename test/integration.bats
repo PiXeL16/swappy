@@ -296,3 +296,89 @@ PY
   [ "$status" -eq 1 ]
   [[ "$output" == *"state"* ]]
 }
+
+@test "use refuses while a fresh switch lock is held, and leaves everything alone" {
+  save_two_profiles
+  mkdir "$HOME/.config/swappy/switch.lock"
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"in progress"* ]]
+  [ "$(read_live_secret)" = "$TOKEN_B" ]
+  [ -d "$HOME/.config/swappy/switch.lock" ]
+}
+
+@test "use overrides a stale switch lock" {
+  save_two_profiles
+  mkdir "$HOME/.config/swappy/switch.lock"
+  touch -t 200001010000 "$HOME/.config/swappy/switch.lock"
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 0 ]
+  [ "$(read_live_secret)" = "$TOKEN_A" ]
+}
+
+@test "use releases the switch lock on success and on failure" {
+  save_two_profiles
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 0 ]
+  [ ! -e "$HOME/.config/swappy/switch.lock" ]
+  run "$SWAPPY" use nope
+  [ "$status" -eq 1 ]
+  [ ! -e "$HOME/.config/swappy/switch.lock" ]
+  simulate_login uuid-stranger-9 stranger@example.com '{"claudeAiOauth":{"accessToken":"s"}}'
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 1 ]
+  [ ! -e "$HOME/.config/swappy/switch.lock" ]
+}
+
+# ---------- switch lock hardening ----------
+
+@test "a fresh lock with a live holder pid is respected well past two minutes" {
+  save_two_profiles
+  sleep 60 3>&- >/dev/null 2>&1 &
+  local holder=$!
+  mkdir "$HOME/.config/swappy/switch.lock"
+  printf '%s' "$holder" > "$HOME/.config/swappy/switch.lock/pid"
+  python3 -c 'import os,sys,time; t=time.time()-300; os.utime(sys.argv[1],(t,t))' "$HOME/.config/swappy/switch.lock"
+  run "$SWAPPY" use alpha
+  kill "$holder" 2>/dev/null || true
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"in progress"* ]]
+  [ -d "$HOME/.config/swappy/switch.lock" ]
+}
+
+@test "a lock whose holder pid is dead is stolen immediately" {
+  save_two_profiles
+  sleep 0 &
+  local dead=$!
+  wait "$dead"
+  mkdir "$HOME/.config/swappy/switch.lock"
+  printf '%s' "$dead" > "$HOME/.config/swappy/switch.lock/pid"
+  run "$SWAPPY" use alpha
+  [ "$status" -eq 0 ]
+  [ ! -e "$HOME/.config/swappy/switch.lock" ]
+}
+
+@test "a lock older than ten minutes is stolen even if its pid looks alive" {
+  save_two_profiles
+  sleep 60 3>&- >/dev/null 2>&1 &
+  local holder=$!
+  mkdir "$HOME/.config/swappy/switch.lock"
+  printf '%s' "$holder" > "$HOME/.config/swappy/switch.lock/pid"
+  python3 -c 'import os,sys,time; t=time.time()-700; os.utime(sys.argv[1],(t,t))' "$HOME/.config/swappy/switch.lock"
+  run "$SWAPPY" use alpha
+  kill "$holder" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+}
+
+@test "release only removes the lock when the nonce is still ours" {
+  run bash -c '
+    source "$1"; SWAPPY_DIR="$2"; SWITCH_LOCK="$2/switch.lock"
+    acquire_switch_lock || exit 10
+    [ -s "$SWITCH_LOCK/pid" ] && [ -s "$SWITCH_LOCK/nonce" ] || exit 11
+    printf other > "$SWITCH_LOCK/nonce"
+    release_switch_lock
+    [ -d "$SWITCH_LOCK" ] || exit 12
+    trap - EXIT
+  ' _ "$SWAPPY" "$HOME/.config/swappy"
+  [ "$status" -eq 0 ]
+}
